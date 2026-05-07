@@ -110,9 +110,10 @@ See `EMAIL_SETUP.md` for configuring email reports.
 - `strategy/signals.py` - Pure signal detection functions
 - `data/` - JSON state files (watchlist, candidates, trade log, memory)
 
-## .env file for reference
-```
+## .env file for reference: 
 ./.env
+```
+
 APCA_API_KEY_ID=
 APCA_API_SECRET_KEY=
 APCA_API_BASE_URL=
