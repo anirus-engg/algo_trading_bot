@@ -6,10 +6,12 @@ import json
 from datetime import datetime
 from anthropic import Anthropic
 import config
+from logger import get_logger
+
+log = get_logger("memory")
 
 
 def load_trade_log() -> dict:
-    """Load trade log."""
     try:
         with open(config.TRADE_LOG_PATH, "r") as f:
             return json.load(f)
@@ -18,7 +20,6 @@ def load_trade_log() -> dict:
 
 
 def load_strategy_memory() -> dict:
-    """Load strategy memory."""
     try:
         with open(config.STRATEGY_MEMORY_PATH, "r") as f:
             return json.load(f)
@@ -27,7 +28,6 @@ def load_strategy_memory() -> dict:
 
 
 def save_strategy_memory(memory: dict):
-    """Save strategy memory."""
     with open(config.STRATEGY_MEMORY_PATH, "w") as f:
         json.dump(memory, f, indent=2)
 
@@ -35,32 +35,25 @@ def save_strategy_memory(memory: dict):
 def compute_signal_performance(trades: list) -> dict:
     """Compute win rate for each signal combination."""
     performance = {}
-    
+
     for trade in trades:
         if "outcome" not in trade:
             continue
-        
         signals = trade.get("signals_at_entry", {})
-        
-        # Build signal key from high-scoring signals
-        signal_keys = []
-        for sig_name, sig_data in signals.items():
-            if isinstance(sig_data, dict) and sig_data.get("points", 0) >= 1:
-                signal_keys.append(sig_name)
-        
+        signal_keys = [
+            name for name, data in signals.items()
+            if isinstance(data, dict) and data.get("points", 0) >= 1
+        ]
         if not signal_keys:
             continue
-        
         key = "+".join(sorted(signal_keys))
-        
         if key not in performance:
             performance[key] = {"wins": 0, "losses": 0}
-        
         if trade["outcome"] == "win":
             performance[key]["wins"] += 1
         else:
             performance[key]["losses"] += 1
-    
+
     return performance
 
 
@@ -68,10 +61,10 @@ def update_memory_with_claude(memory: dict, new_trades: list) -> dict:
     """Use Claude to analyze new trades and update strategy notes."""
     if not config.ANTHROPIC_API_KEY or not new_trades:
         return memory
-    
+
+    log.info(f"Sending {len(new_trades)} new trades to Claude for analysis...")
     client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
-    
-    # Build prompt
+
     prompt = f"""You are analyzing our swing trading performance to improve our strategy.
 
 Current strategy memory:
@@ -84,7 +77,7 @@ Tasks:
 1. Analyze what's working and what's not
 2. Identify patterns in winning vs losing trades
 3. Update the "strategy_notes" field with actionable insights
-4. Suggest any rule adjustments (e.g., avoid certain signal combos, increase weight on others)
+4. Suggest any rule adjustments
 
 Return the updated memory object as valid JSON with an updated "strategy_notes" field.
 Keep it concise (max 500 words)."""
@@ -94,58 +87,76 @@ Keep it concise (max 500 words)."""
             model="claude-3-5-sonnet-20241022",
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
-            system=[
-                {
-                    "type": "text",
-                    "text": "You are a quantitative trading analyst. Return only valid JSON.",
-                    "cache_control": {"type": "ephemeral"}
-                }
-            ]
+            system=[{
+                "type": "text",
+                "text": "You are a quantitative trading analyst. Return only valid JSON.",
+                "cache_control": {"type": "ephemeral"}
+            }]
         )
-        
+
         content = response.content[0].text
         updated_memory = json.loads(content)
+        log.info(f"Strategy notes updated by Claude")
+        log.debug(f"New strategy notes: {updated_memory.get('strategy_notes', '')[:300]}")
         return updated_memory
-    
+
     except Exception as e:
-        print(f"  Warning: Claude memory update failed: {e}")
+        log.warning(f"Claude memory update failed: {e}")
         return memory
 
 
 def run():
     """Main memory agent logic."""
-    print(f"[{datetime.now()}] Memory Agent: Loading trade log...")
-    
-    log = load_trade_log()
+    log.info("=" * 60)
+    log.info("MEMORY AGENT STARTING")
+    log.info("=" * 60)
+
+    trade_log = load_trade_log()
     memory = load_strategy_memory()
-    
-    # Find new closed trades (not yet in memory)
-    existing_trade_count = len(memory["trades"])
-    new_trades = log["closed_trades"][existing_trade_count:]
-    
+
+    total_closed = len(trade_log["closed_trades"])
+    existing_count = len(memory["trades"])
+    new_trades = trade_log["closed_trades"][existing_count:]
+
+    log.info(f"Total closed trades: {total_closed}")
+    log.info(f"Already in memory: {existing_count}")
+    log.info(f"New trades to process: {len(new_trades)}")
+
     if not new_trades:
-        print(f"[{datetime.now()}] Memory Agent: No new closed trades")
+        log.info("No new closed trades — memory unchanged")
         return memory
-    
-    print(f"[{datetime.now()}] Memory Agent: Processing {len(new_trades)} new trades...")
-    
-    # Append new trades to memory
+
+    # Log each new trade
+    for trade in new_trades:
+        symbol = trade.get("symbol", "?")
+        pnl = trade.get("pnl", 0)
+        outcome = trade.get("outcome", "unknown")
+        reason = trade.get("exit_reason", "unknown")
+        log.info(f"  New trade: {symbol} | outcome={outcome} | P&L=${pnl:.2f} | exit={reason}")
+
     memory["trades"].extend(new_trades)
-    
-    # Recompute signal performance
     memory["signal_performance"] = compute_signal_performance(memory["trades"])
-    
-    # Update strategy notes with Claude
-    print(f"[{datetime.now()}] Memory Agent: Updating strategy notes with Claude...")
+
+    # Log signal performance
+    log.info("Signal performance (all time):")
+    for combo, stats in memory["signal_performance"].items():
+        total = stats["wins"] + stats["losses"]
+        win_rate = (stats["wins"] / total * 100) if total > 0 else 0
+        log.info(f"  {combo}: {stats['wins']}W/{stats['losses']}L ({win_rate:.0f}% win rate)")
+
+    # Overall stats
+    all_trades = memory["trades"]
+    wins = sum(1 for t in all_trades if t.get("outcome") == "win")
+    total = len(all_trades)
+    total_pnl = sum(t.get("pnl", 0) for t in all_trades)
+    win_rate = (wins / total * 100) if total > 0 else 0
+    log.info(f"Overall: {total} trades | {win_rate:.0f}% win rate | total P&L=${total_pnl:,.2f}")
+
     memory = update_memory_with_claude(memory, new_trades)
-    
-    # Save updated memory
+
     save_strategy_memory(memory)
-    
-    print(f"[{datetime.now()}] Memory Agent: Memory updated")
-    print(f"  Total trades: {len(memory['trades'])}")
-    print(f"  Signal combos tracked: {len(memory['signal_performance'])}")
-    
+    log.info(f"Strategy memory saved to {config.STRATEGY_MEMORY_PATH}")
+    log.info("MEMORY AGENT COMPLETE")
     return memory
 
 

@@ -4,9 +4,9 @@ Runs after strategy agent, then every 30 min intraday.
 Never closes same-day positions.
 """
 import json
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, StopLossRequest, TakeProfitRequest
+from alpaca.trading.requests import MarketOrderRequest, StopLossRequest, TakeProfitRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -14,10 +14,12 @@ from alpaca.data.timeframe import TimeFrame
 import pandas as pd
 import config
 from strategy.signals import add_all_indicators, should_exit
+from logger import get_logger
+
+log = get_logger("execution")
 
 
 def load_candidates() -> list:
-    """Load trade candidates."""
     try:
         with open(config.CANDIDATES_PATH, "r") as f:
             data = json.load(f)
@@ -27,7 +29,6 @@ def load_candidates() -> list:
 
 
 def load_trade_log() -> dict:
-    """Load trade log."""
     try:
         with open(config.TRADE_LOG_PATH, "r") as f:
             return json.load(f)
@@ -35,68 +36,32 @@ def load_trade_log() -> dict:
         return {"open_positions": {}, "closed_trades": []}
 
 
-def save_trade_log(log: dict):
-    """Save trade log."""
+def save_trade_log(log_data: dict):
     with open(config.TRADE_LOG_PATH, "w") as f:
-        json.dump(log, f, indent=2)
+        json.dump(log_data, f, indent=2)
 
 
 def get_open_positions(client: TradingClient) -> dict:
-    """Get current open positions from Alpaca."""
     positions = client.get_all_positions()
     return {p.symbol: p for p in positions}
 
 
 def get_account(client: TradingClient):
-    """Get account info."""
     return client.get_account()
 
 
-def place_bracket_order(client: TradingClient, candidate: dict) -> dict:
-    """Place a bracket order (entry + stop + target)."""
-    symbol = candidate["symbol"]
-    shares = candidate["shares"]
-    stop_loss = candidate["stop_loss"]
-    take_profit = candidate["take_profit"]
-    
-    try:
-        order_data = MarketOrderRequest(
-            symbol=symbol,
-            qty=shares,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY,
-            order_class=OrderClass.BRACKET,
-            stop_loss=StopLossRequest(stop_price=stop_loss),
-            take_profit=TakeProfitRequest(limit_price=take_profit)
-        )
-        
-        order = client.submit_order(order_data)
-        
-        return {
-            "success": True,
-            "order_id": str(order.id),
-            "symbol": symbol,
-            "shares": shares,
-            "entry": candidate["entry"],
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
-            "entry_date": str(date.today()),
-            "reasoning": candidate.get("reasoning", ""),
-            "signals": candidate.get("signals", {}),
-        }
-    except Exception as e:
-        return {"success": False, "symbol": symbol, "error": str(e)}
-
-
 def fetch_bars_batch(symbols: list) -> dict:
-    """Fetch daily bars for multiple symbols in one API call."""
+    """Fetch 6 months of daily bars for multiple symbols in one API call."""
     if not symbols:
         return {}
     client_data = StockHistoricalDataClient(config.APCA_API_KEY_ID, config.APCA_API_SECRET_KEY)
+    end = datetime.now()
+    start = end - timedelta(days=config.BARS_LOOKBACK_DAYS)
     request = StockBarsRequest(
         symbol_or_symbols=symbols,
         timeframe=TimeFrame.Day,
-        limit=60
+        start=start,
+        end=end
     )
     bars = client_data.get_stock_bars(request)
     multi_df = bars.df if hasattr(bars, 'df') else bars
@@ -110,49 +75,107 @@ def fetch_bars_batch(symbols: list) -> dict:
                     result[symbol] = df
             except KeyError:
                 pass
+    log.debug(f"Batch bar fetch: got data for {len(result)}/{len(symbols)} symbols")
     return result
 
 
-def check_exit_signals(client: TradingClient, log: dict):
-    """Check if any open positions should be exited (no same-day closes)."""
+def place_bracket_order(client: TradingClient, candidate: dict) -> dict:
+    """Place a bracket order (entry + stop + target)."""
+    symbol = candidate["symbol"]
+    shares = candidate["shares"]
+    stop_loss = candidate["stop_loss"]
+    take_profit = candidate["take_profit"]
+
+    log.info(
+        f"{symbol}: Placing bracket order — "
+        f"{shares} shares @ ${candidate['entry']} | "
+        f"stop=${stop_loss} | target=${take_profit} | "
+        f"notional=${candidate['notional']}"
+    )
+
+    try:
+        from alpaca.trading.requests import MarketOrderRequest
+        order_data = MarketOrderRequest(
+            symbol=symbol,
+            qty=shares,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            order_class=OrderClass.BRACKET,
+            stop_loss=StopLossRequest(stop_price=stop_loss),
+            take_profit=TakeProfitRequest(limit_price=take_profit)
+        )
+
+        order = client.submit_order(order_data)
+        log.info(f"{symbol}: Order submitted successfully — order_id={order.id}")
+
+        return {
+            "success": True,
+            "order_id": str(order.id),
+            "symbol": symbol,
+            "shares": shares,
+            "entry": candidate["entry"],
+            "entry_price": candidate["entry"],
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "entry_date": str(date.today()),
+            "reasoning": candidate.get("reasoning", ""),
+            "signals": candidate.get("signals", {}),
+            "signals_at_entry": candidate.get("signals", {}),
+            "score": candidate.get("score", 0),
+        }
+    except Exception as e:
+        log.error(f"{symbol}: Order failed — {e}")
+        return {"success": False, "symbol": symbol, "error": str(e)}
+
+
+def check_exit_signals(client: TradingClient, trade_log: dict):
+    """Check if any open positions should be exited. Never closes same-day positions."""
     today = str(date.today())
     alpaca_positions = get_open_positions(client)
 
-    # Batch fetch bars for all open positions in one call
+    log.info(f"Checking exit signals for {len(trade_log['open_positions'])} open positions...")
+
     symbols_to_check = [
-        sym for sym, pos in log["open_positions"].items()
+        sym for sym, pos in trade_log["open_positions"].items()
         if pos.get("entry_date") != today and sym in alpaca_positions
     ]
 
+    same_day = [
+        sym for sym, pos in trade_log["open_positions"].items()
+        if pos.get("entry_date") == today
+    ]
+
+    if same_day:
+        log.info(f"Skipping same-day positions (no early exit): {same_day}")
+
     bars_by_symbol = fetch_bars_batch(symbols_to_check) if symbols_to_check else {}
 
-    for symbol, position_data in list(log["open_positions"].items()):
+    for symbol, position_data in list(trade_log["open_positions"].items()):
         entry_date = position_data.get("entry_date")
 
-        # Never close same-day
         if entry_date == today:
             continue
 
-        # Check if position still exists on Alpaca
         if symbol not in alpaca_positions:
+            log.info(f"{symbol}: Position no longer on Alpaca — bracket order filled (stop or target hit)")
             closed_trade = position_data.copy()
             closed_trade["exit_date"] = today
             closed_trade["exit_reason"] = "bracket_order_filled"
-            log["closed_trades"].append(closed_trade)
-            del log["open_positions"][symbol]
-            print(f"  {symbol}: Position closed via bracket order")
+            trade_log["closed_trades"].append(closed_trade)
+            del trade_log["open_positions"][symbol]
             continue
 
-        # Check exit signals using batched bar data
         try:
             df = bars_by_symbol.get(symbol)
             if df is None or df.empty:
+                log.debug(f"{symbol}: no bar data for exit check")
                 continue
 
             df = add_all_indicators(df)
             exit_signal = should_exit(df, position_data)
 
             if exit_signal["exit"]:
+                log.info(f"{symbol}: EXIT signal triggered — reason={exit_signal['reason']}")
                 alpaca_pos = alpaca_positions[symbol]
                 sell_order = MarketOrderRequest(
                     symbol=symbol,
@@ -165,76 +188,90 @@ def check_exit_signals(client: TradingClient, log: dict):
                 closed_trade = position_data.copy()
                 closed_trade["exit_date"] = today
                 closed_trade["exit_reason"] = exit_signal["reason"]
-                log["closed_trades"].append(closed_trade)
-                del log["open_positions"][symbol]
-
-                print(f"  {symbol}: Exit signal triggered ({exit_signal['reason']})")
+                trade_log["closed_trades"].append(closed_trade)
+                del trade_log["open_positions"][symbol]
+                log.info(f"{symbol}: Sell order submitted")
+            else:
+                log.debug(f"{symbol}: holding — {exit_signal['reason']}")
 
         except Exception as e:
-            print(f"  Error checking exit for {symbol}: {e}")
+            log.warning(f"{symbol}: exit check error — {e}")
             continue
 
 
 def run():
     """Main execution agent logic."""
-    print(f"[{datetime.now()}] Execution Agent: Starting...")
-    
+    log.info("=" * 60)
+    log.info("EXECUTION AGENT STARTING")
+    log.info("=" * 60)
+
     client = TradingClient(config.APCA_API_KEY_ID, config.APCA_API_SECRET_KEY, paper=True)
-    
-    # Load state
+
     candidates = load_candidates()
-    log = load_trade_log()
-    
-    # Check account
+    trade_log = load_trade_log()
+
     account = get_account(client)
     buying_power = float(account.buying_power)
-    print(f"  Buying power: ${buying_power:,.2f}")
-    
-    # Check existing positions
+    portfolio_value = float(account.portfolio_value)
+    log.info(f"Account — portfolio=${portfolio_value:,.2f}, buying_power=${buying_power:,.2f}")
+
     alpaca_positions = get_open_positions(client)
-    num_open = len(alpaca_positions)
-    print(f"  Open positions: {num_open}")
-    
-    # Check exit signals for open positions
-    if log["open_positions"]:
-        print(f"[{datetime.now()}] Execution Agent: Checking exit signals...")
-        check_exit_signals(client, log)
-    
-    # Place new orders if we have room
-    if num_open < config.MAX_OPEN_POSITIONS and candidates:
-        print(f"[{datetime.now()}] Execution Agent: Placing new orders...")
-        
+    log.info(f"Open positions on Alpaca: {list(alpaca_positions.keys()) or 'none'}")
+    log.info(f"Tracked positions in log: {list(trade_log['open_positions'].keys()) or 'none'}")
+
+    # Check exits first
+    if trade_log["open_positions"]:
+        check_exit_signals(client, trade_log)
+    else:
+        log.info("No open positions to check for exits")
+
+    # Place new orders
+    num_open = len(get_open_positions(client))
+    slots_available = config.MAX_OPEN_POSITIONS - num_open
+    log.info(f"Position slots: {num_open}/{config.MAX_OPEN_POSITIONS} used, {slots_available} available")
+
+    if slots_available <= 0:
+        log.info("Max positions reached — no new orders")
+    elif not candidates:
+        log.info("No qualified candidates — no new orders")
+    else:
+        log.info(f"Evaluating {len(candidates)} candidates for entry...")
+        orders_placed = 0
+
         for candidate in candidates:
-            if num_open >= config.MAX_OPEN_POSITIONS:
+            if orders_placed >= slots_available:
+                log.info(f"Position limit reached — stopping after {orders_placed} orders")
                 break
-            
+
             symbol = candidate["symbol"]
-            
-            # Skip if already have position
-            if symbol in alpaca_positions or symbol in log["open_positions"]:
+
+            if symbol in alpaca_positions or symbol in trade_log["open_positions"]:
+                log.info(f"{symbol}: already have position — skipping")
                 continue
-            
-            # Check buying power
+
             if candidate["notional"] > buying_power:
+                log.warning(
+                    f"{symbol}: insufficient buying power "
+                    f"(need ${candidate['notional']:,.2f}, have ${buying_power:,.2f}) — skipping"
+                )
                 continue
-            
-            # Place order
+
             result = place_bracket_order(client, candidate)
-            
+
             if result["success"]:
-                log["open_positions"][symbol] = result
+                trade_log["open_positions"][symbol] = result
                 buying_power -= candidate["notional"]
-                num_open += 1
-                print(f"  {symbol}: Order placed ({candidate['shares']} shares @ ${candidate['entry']})")
+                orders_placed += 1
+                log.info(f"{symbol}: Position opened — {orders_placed}/{slots_available} slots used")
             else:
-                print(f"  {symbol}: Order failed - {result.get('error')}")
-    
-    # Save log
-    save_trade_log(log)
-    
-    print(f"[{datetime.now()}] Execution Agent: Complete")
-    
-    return log
+                log.error(f"{symbol}: Failed to place order — {result.get('error')}")
+
+        log.info(f"New orders placed: {orders_placed}")
+
+    save_trade_log(trade_log)
+    log.info(f"Trade log saved — {len(trade_log['open_positions'])} open, {len(trade_log['closed_trades'])} closed")
+    log.info("EXECUTION AGENT COMPLETE")
+    return trade_log
 
 
 if __name__ == "__main__":

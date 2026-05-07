@@ -58,6 +58,9 @@ SCAN_UNIVERSE = [
 # Deduplicate
 SCAN_UNIVERSE = list(dict.fromkeys(SCAN_UNIVERSE))
 
+# Data fetch window
+BARS_LOOKBACK_DAYS = 180  # 6 months of daily bars (~126 trading days)
+
 # Watchlist size
 WATCHLIST_SIZE = 25
 

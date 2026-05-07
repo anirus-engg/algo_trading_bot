@@ -1,130 +1,125 @@
 #!/usr/bin/env python3
 """
-Main orchestrator: Chains all agents in sequence.
-Runs on schedule via cron or Launch Agent.
+Main orchestrator: Chains all agents in sequence on schedule.
 """
 import time
 import schedule
 from datetime import datetime
-from agents import watchlist_agent, research_agent, strategy_agent, execution_agent, memory_agent, email_agent
+from agents import watchlist_agent, research_agent, strategy_agent, execution_agent, memory_agent, email_agent, universe_agent
 import config
+from logger import get_logger
+
+log = get_logger("orchestrator")
+
+
+def weekly_universe_refresh():
+    log.info("=" * 60)
+    log.info("WEEKLY UNIVERSE REFRESH STARTING")
+    log.info("=" * 60)
+    try:
+        universe_agent.run()
+        log.info("UNIVERSE REFRESH COMPLETE")
+    except Exception as e:
+        log.error(f"ERROR refreshing universe: {e}", exc_info=True)
 
 
 def morning_sequence():
-    """Run the full morning agent sequence."""
-    print(f"\n{'='*60}")
-    print(f"[{datetime.now()}] Starting morning sequence")
-    print(f"{'='*60}\n")
-    
+    log.info("=" * 60)
+    log.info("MORNING SEQUENCE STARTING")
+    log.info("=" * 60)
     try:
-        # 1. Watchlist
+        log.info("Step 1/4: Watchlist Agent")
         watchlist_agent.run()
         time.sleep(5)
-        
-        # 2. Research
+
+        log.info("Step 2/4: Research Agent")
         research_agent.run()
         time.sleep(5)
-        
-        # 3. Strategy
+
+        log.info("Step 3/4: Strategy Agent")
         strategy_agent.run()
         time.sleep(5)
-        
-        # 4. Execution
+
+        log.info("Step 4/4: Execution Agent")
         execution_agent.run()
-        
-        print(f"\n[{datetime.now()}] Morning sequence complete\n")
-    
+
+        log.info("MORNING SEQUENCE COMPLETE")
     except Exception as e:
-        print(f"\n[{datetime.now()}] ERROR in morning sequence: {e}\n")
+        log.error(f"ERROR in morning sequence: {e}", exc_info=True)
 
 
 def intraday_execution():
-    """Run execution agent for position management."""
-    print(f"\n[{datetime.now()}] Running intraday execution check...")
+    log.info("--- Intraday execution check ---")
     try:
         execution_agent.run()
     except Exception as e:
-        print(f"[{datetime.now()}] ERROR in intraday execution: {e}")
+        log.error(f"ERROR in intraday execution: {e}", exc_info=True)
 
 
 def end_of_day_watchlist():
-    """Refresh watchlist at end of day so it's ready for tomorrow morning."""
-    print(f"\n[{datetime.now()}] Refreshing end-of-day watchlist...")
+    log.info("--- End-of-day watchlist refresh ---")
     try:
         watchlist_agent.run()
-        print(f"[{datetime.now()}] Watchlist refreshed\n")
     except Exception as e:
-        print(f"\n[{datetime.now()}] ERROR refreshing watchlist: {e}\n")
+        log.error(f"ERROR refreshing watchlist: {e}", exc_info=True)
 
 
 def end_of_day_email():
-    """Send daily summary email."""
-    print(f"\n{'='*60}")
-    print(f"[{datetime.now()}] Sending daily summary email")
-    print(f"{'='*60}\n")
-    
+    log.info("--- Sending daily summary email ---")
     try:
         email_agent.run()
-        print(f"\n[{datetime.now()}] Email sent\n")
     except Exception as e:
-        print(f"\n[{datetime.now()}] ERROR sending email: {e}\n")
+        log.error(f"ERROR sending email: {e}", exc_info=True)
 
 
 def end_of_day_memory():
-    """Run memory agent after market close."""
-    print(f"\n{'='*60}")
-    print(f"[{datetime.now()}] Running end-of-day memory update")
-    print(f"{'='*60}\n")
-    
+    log.info("=" * 60)
+    log.info("END-OF-DAY MEMORY UPDATE STARTING")
+    log.info("=" * 60)
     try:
         memory_agent.run()
-        print(f"\n[{datetime.now()}] Memory update complete\n")
+        log.info("MEMORY UPDATE COMPLETE")
     except Exception as e:
-        print(f"\n[{datetime.now()}] ERROR in memory update: {e}\n")
+        log.error(f"ERROR in memory update: {e}", exc_info=True)
 
 
 def setup_schedule():
-    """Set up the daily schedule."""
-    # Morning sequence
+    schedule.every().monday.at("06:30").do(weekly_universe_refresh)
+    log.info("Scheduled: weekly universe refresh — Monday 06:30 ET")
+
     schedule_time = f"{config.WATCHLIST_HOUR:02d}:{config.WATCHLIST_MINUTE:02d}"
     schedule.every().day.at(schedule_time).do(morning_sequence)
-    print(f"Scheduled morning sequence at {schedule_time} ET")
-    
-    # Intraday execution checks (every 30 min from 9am to 4pm)
+    log.info(f"Scheduled: morning sequence — {schedule_time} ET")
+
     for hour in range(9, 16):
         for minute in [0, 30]:
             schedule.every().day.at(f"{hour:02d}:{minute:02d}").do(intraday_execution)
-    print(f"Scheduled intraday execution checks every 30 min (9am-4pm ET)")
-    
-    # End of day: email → watchlist refresh → memory (in sequence, 15 min apart)
+    log.info("Scheduled: intraday execution checks — every 30 min 9am-4pm ET")
+
     email_time = f"{config.EMAIL_HOUR:02d}:{config.EMAIL_MINUTE:02d}"
     schedule.every().day.at(email_time).do(end_of_day_email)
-    print(f"Scheduled daily summary email at {email_time} ET")
+    log.info(f"Scheduled: daily email — {email_time} ET")
 
     eod_watchlist_time = f"{config.WATCHLIST_EOD_HOUR:02d}:{config.WATCHLIST_EOD_MINUTE:02d}"
     schedule.every().day.at(eod_watchlist_time).do(end_of_day_watchlist)
-    print(f"Scheduled end-of-day watchlist refresh at {eod_watchlist_time} ET")
+    log.info(f"Scheduled: EOD watchlist refresh — {eod_watchlist_time} ET")
 
     eod_time = f"{config.MEMORY_HOUR:02d}:{config.MEMORY_MINUTE:02d}"
     schedule.every().day.at(eod_time).do(end_of_day_memory)
-    print(f"Scheduled end-of-day memory update at {eod_time} ET")
+    log.info(f"Scheduled: EOD memory update — {eod_time} ET")
 
 
 def main():
-    """Main loop."""
-    print(f"\n{'='*60}")
-    print(f"Stock Trading Agent - Starting")
-    print(f"{'='*60}\n")
-    
+    log.info("=" * 60)
+    log.info("STOCK TRADING AGENT STARTING")
+    log.info("=" * 60)
+
     setup_schedule()
-    
-    print(f"\nAgent is running. Press Ctrl+C to stop.\n")
-    
-    # Run immediately on startup for testing
-    print("[STARTUP] Running morning sequence immediately for testing...")
+
+    log.info("Running startup morning sequence...")
     morning_sequence()
-    
-    # Then run on schedule
+
+    log.info("Agent running. Waiting for scheduled jobs...")
     while True:
         schedule.run_pending()
         time.sleep(60)
@@ -134,4 +129,4 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\nShutting down gracefully...\n")
+        log.info("Shutting down gracefully...")

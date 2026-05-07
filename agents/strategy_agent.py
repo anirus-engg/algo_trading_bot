@@ -11,24 +11,24 @@ from alpaca.data.timeframe import TimeFrame
 from anthropic import Anthropic
 import config
 from strategy.signals import add_all_indicators, score_setup, calculate_entry_levels
+from logger import get_logger
+
+log = get_logger("strategy")
 
 
 def load_watchlist() -> list:
-    """Load watchlist symbols."""
     with open(config.WATCHLIST_PATH, "r") as f:
         data = json.load(f)
     return [item["symbol"] for item in data["watchlist"]]
 
 
 def load_research_brief() -> dict:
-    """Load research brief."""
     with open(config.RESEARCH_BRIEF_PATH, "r") as f:
         data = json.load(f)
     return data["brief"]
 
 
 def load_strategy_memory() -> dict:
-    """Load strategy memory (for prompt caching)."""
     try:
         with open(config.STRATEGY_MEMORY_PATH, "r") as f:
             return json.load(f)
@@ -36,8 +36,9 @@ def load_strategy_memory() -> dict:
         return {"trades": [], "strategy_notes": "No trades yet.", "signal_performance": {}}
 
 
-def fetch_bars_batch(symbols: list, days: int = 60) -> dict:
-    """Fetch daily bars for all symbols in a single API call. Returns dict of symbol -> DataFrame."""
+def fetch_bars_batch(symbols: list, days: int = config.BARS_LOOKBACK_DAYS) -> dict:
+    """Fetch daily bars for all symbols in a single API call."""
+    log.info(f"Fetching {days}-day bars for {len(symbols)} symbols (single batch call)...")
     client = StockHistoricalDataClient(config.APCA_API_KEY_ID, config.APCA_API_SECRET_KEY)
     end = datetime.now()
     start = end - timedelta(days=days)
@@ -56,31 +57,36 @@ def fetch_bars_batch(symbols: list, days: int = 60) -> dict:
     if isinstance(multi_df, pd.DataFrame) and not multi_df.empty:
         for symbol in symbols:
             try:
-                if multi_df.index.nlevels > 1:
-                    df = multi_df.xs(symbol, level=0).copy()
-                else:
-                    df = multi_df.copy()
+                df = multi_df.xs(symbol, level=0).copy() if multi_df.index.nlevels > 1 else multi_df.copy()
                 if not df.empty:
                     result[symbol] = df
             except KeyError:
-                pass  # symbol had no data
+                pass
 
+    log.info(f"Bar data received for {len(result)}/{len(symbols)} symbols")
     return result
 
 
 def score_candidates(watchlist: list, brief: dict, memory: dict) -> list:
     """Score all watchlist stocks and return qualified candidates."""
     candidates = []
+    disqualified = []
 
-    # Single batched API call for all symbols
-    print(f"  Fetching bars for {len(watchlist)} symbols in one batch call...")
     bars_by_symbol = fetch_bars_batch(watchlist)
-    print(f"  Got data for {len(bars_by_symbol)}/{len(watchlist)} symbols")
+
+    log.info(f"Scoring {len(watchlist)} stocks against strategy rules...")
 
     for symbol in watchlist:
         try:
             df = bars_by_symbol.get(symbol)
-            if df is None or df.empty or len(df) < 52:
+            if df is None or df.empty:
+                log.debug(f"{symbol}: no bar data — skipping")
+                disqualified.append((symbol, "no_data"))
+                continue
+
+            if len(df) < 52:
+                log.debug(f"{symbol}: only {len(df)} bars (need 52) — skipping")
+                disqualified.append((symbol, f"only_{len(df)}_bars"))
                 continue
 
             df = add_all_indicators(df)
@@ -93,10 +99,16 @@ def score_candidates(watchlist: list, brief: dict, memory: dict) -> list:
             score_result = score_setup(df, news_sentiment=sentiment)
 
             if not score_result.get("qualified"):
+                reason = score_result.get("reason", "score_too_low")
+                score = score_result.get("score", 0)
+                log.debug(f"{symbol}: disqualified — {reason} (score={score})")
+                disqualified.append((symbol, reason))
                 continue
 
             entry_levels = calculate_entry_levels(score_result, config.MAX_POSITION_SIZE)
             if not entry_levels:
+                log.debug(f"{symbol}: entry level calculation failed")
+                disqualified.append((symbol, "entry_calc_failed"))
                 continue
 
             candidate = {
@@ -113,95 +125,122 @@ def score_candidates(watchlist: list, brief: dict, memory: dict) -> list:
                 "sentiment": sentiment,
             }
 
+            log.info(
+                f"{symbol}: QUALIFIED score={score_result['score']} "
+                f"entry=${entry_levels['entry']} stop=${entry_levels['stop_loss']} "
+                f"target=${entry_levels['take_profit']} shares={entry_levels['shares']} "
+                f"notional=${entry_levels['notional']} sentiment={sentiment}"
+            )
+
+            # Log which signals fired
+            for sig_name, sig_data in score_result.get("signals", {}).items():
+                if isinstance(sig_data, dict) and sig_data.get("points", 0) > 0:
+                    log.debug(f"  {symbol} signal [{sig_name}]: {sig_data}")
+
             candidates.append(candidate)
 
         except Exception as e:
-            print(f"  Error scoring {symbol}: {e}")
+            log.warning(f"{symbol}: unexpected error — {e}")
+            disqualified.append((symbol, f"error: {e}"))
             continue
+
+    log.info(f"Scoring complete: {len(candidates)} qualified, {len(disqualified)} disqualified")
+
+    if disqualified:
+        reason_counts = {}
+        for _, reason in disqualified:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        log.info(f"Disqualification reasons: {reason_counts}")
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates
 
 
 def add_claude_reasoning(candidates: list, memory: dict) -> list:
-    """Use Claude to add reasoning for each candidate (batched call)."""
+    """Add Claude reasoning to each candidate (batched call)."""
     if not config.ANTHROPIC_API_KEY or not candidates:
+        for c in candidates:
+            c["reasoning"] = f"Score {c['score']}: Technical setup with {c['sentiment']} sentiment."
         return candidates
-    
+
+    log.info(f"Requesting Claude reasoning for {len(candidates)} candidates...")
     client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
-    
-    # Build cached system prompt with strategy memory
+
     system_prompt = f"""You are a swing trading strategist. Based on our trading history, provide brief reasoning for each trade candidate.
 
-Strategy Memory (cached):
+Strategy Memory:
 {json.dumps(memory, indent=2)}
 
-For each candidate, explain in 1-2 sentences why this setup looks promising based on the signals and our past performance with similar setups."""
-    
-    candidates_json = json.dumps(candidates, indent=2)
-    
+For each candidate, explain in 1-2 sentences why this setup looks promising based on the signals and our past performance."""
+
     prompt = f"""Here are today's trade candidates:
 
-{candidates_json}
+{json.dumps(candidates, indent=2)}
 
-For each candidate, add a "reasoning" field with 1-2 sentences explaining why this setup is strong.
-Return the full candidates array as valid JSON with the reasoning field added."""
-    
+Add a "reasoning" field to each candidate with 1-2 sentences.
+Return the full candidates array as valid JSON."""
+
     try:
         response = client.messages.create(
             model="claude-3-5-sonnet-20241022",
             max_tokens=3000,
             messages=[{"role": "user", "content": prompt}],
-            system=[
-                {
-                    "type": "text",
-                    "text": system_prompt,
-                    "cache_control": {"type": "ephemeral"}
-                }
-            ]
+            system=[{
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"}
+            }]
         )
-        
+
         content = response.content[0].text
         enriched = json.loads(content)
+        for c in enriched:
+            log.info(f"{c.get('symbol')}: {c.get('reasoning', '')[:100]}")
         return enriched
+
     except Exception as e:
-        print(f"  Warning: Claude reasoning failed: {e}")
-        # Add default reasoning
+        log.warning(f"Claude reasoning failed: {e}")
         for c in candidates:
-            c["reasoning"] = f"Score {c['score']}: Strong technical setup with {c['sentiment']} sentiment."
+            c["reasoning"] = f"Score {c['score']}: Technical setup with {c['sentiment']} sentiment."
         return candidates
 
 
 def run():
     """Main strategy agent logic."""
-    print(f"[{datetime.now()}] Strategy Agent: Loading inputs...")
-    
+    log.info("=" * 60)
+    log.info("STRATEGY AGENT STARTING")
+    log.info("=" * 60)
+
     watchlist = load_watchlist()
     brief = load_research_brief()
     memory = load_strategy_memory()
-    
-    print(f"[{datetime.now()}] Strategy Agent: Scoring {len(watchlist)} stocks...")
+
+    log.info(f"Watchlist: {watchlist}")
+    log.info(f"Strategy memory: {len(memory.get('trades', []))} historical trades")
+    if memory.get("strategy_notes"):
+        log.info(f"Strategy notes: {memory['strategy_notes'][:200]}")
+
     candidates = score_candidates(watchlist, brief, memory)
-    
-    print(f"[{datetime.now()}] Strategy Agent: Found {len(candidates)} qualified candidates")
-    
+
     if candidates:
-        print(f"[{datetime.now()}] Strategy Agent: Adding Claude reasoning...")
+        log.info(f"Adding Claude reasoning to {len(candidates)} candidates...")
         candidates = add_claude_reasoning(candidates, memory)
-    
-    # Save candidates
+
     output = {
         "generated_at": datetime.now().isoformat(),
         "candidates": candidates,
     }
-    
+
     with open(config.CANDIDATES_PATH, "w") as f:
         json.dump(output, f, indent=2)
-    
-    print(f"[{datetime.now()}] Strategy Agent: Saved {len(candidates)} candidates")
+
+    log.info(f"Candidates saved to {config.CANDIDATES_PATH}")
     if candidates:
-        print(f"  Top 3: {[c['symbol'] for c in candidates[:3]]}")
-    
+        log.info(f"Top candidates: {[c['symbol'] for c in candidates[:5]]}")
+    else:
+        log.info("No qualified candidates today")
+
+    log.info("STRATEGY AGENT COMPLETE")
     return candidates
 
 
