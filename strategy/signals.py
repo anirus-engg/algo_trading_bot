@@ -1,19 +1,26 @@
 """
-Pure signal detection functions. No side effects, no I/O.
-All functions take a pandas DataFrame of OHLCV daily bars.
+Pure signal detection functions for intraday (5-min) day trading.
+No side effects, no I/O. All functions take a pandas DataFrame of OHLCV bars.
+
+Strategy: VWAP Reclaim
+  - Price dips below VWAP then closes back above it
+  - EMA9 > EMA20 (intraday uptrend intact)
+  - RSI < 70 (not overbought / exhausted)
+  - Reclaim candle volume > 20-bar average (conviction)
 """
 import pandas as pd
 import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# Trend & momentum indicators
+# Intraday indicators (5-min bars)
 # ---------------------------------------------------------------------------
 
-def compute_emas(df: pd.DataFrame) -> pd.DataFrame:
+def compute_emas(df: pd.DataFrame, fast: int = 9, slow: int = 20) -> pd.DataFrame:
+    """EMA9 and EMA20 for intraday trend direction."""
     df = df.copy()
-    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+    df["ema_fast"] = df["close"].ewm(span=fast, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=slow, adjust=False).mean()
     return df
 
 
@@ -29,17 +36,8 @@ def compute_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     return df
 
 
-def compute_macd(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    ema12 = df["close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["close"].ewm(span=26, adjust=False).mean()
-    df["macd"] = ema12 - ema26
-    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-    df["macd_hist"] = df["macd"] - df["macd_signal"]
-    return df
-
-
 def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    """Average True Range — used for stop sizing."""
     df = df.copy()
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift()).abs()
@@ -49,277 +47,221 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     return df
 
 
-def compute_roc(df: pd.DataFrame, period: int = 10) -> pd.DataFrame:
-    df = df.copy()
-    df["roc"] = df["close"].pct_change(periods=period) * 100
-    return df
-
-
 def compute_vwap(df: pd.DataFrame) -> pd.DataFrame:
-    """Approximate daily VWAP from OHLCV bars."""
+    """
+    Session VWAP — resets each trading day.
+    Requires a DatetimeIndex. Falls back to cumulative VWAP if date info unavailable.
+    """
     df = df.copy()
-    typical_price = (df["high"] + df["low"] + df["close"]) / 3
-    df["vwap"] = (typical_price * df["volume"]).cumsum() / df["volume"].cumsum()
+
+    if isinstance(df.index, pd.DatetimeIndex):
+        df["date"] = df.index.date
+        df["typical_price"] = (df["high"] + df["low"] + df["close"]) / 3
+        df["tp_vol"] = df["typical_price"] * df["volume"]
+
+        # Cumulative sums reset per day
+        df["cum_tp_vol"] = df.groupby("date")["tp_vol"].cumsum()
+        df["cum_vol"] = df.groupby("date")["volume"].cumsum()
+        df["vwap"] = df["cum_tp_vol"] / df["cum_vol"]
+
+        df.drop(columns=["date", "typical_price", "tp_vol", "cum_tp_vol", "cum_vol"],
+                inplace=True)
+    else:
+        # Fallback: cumulative VWAP across all bars
+        typical_price = (df["high"] + df["low"] + df["close"]) / 3
+        df["vwap"] = (typical_price * df["volume"]).cumsum() / df["volume"].cumsum()
+
     return df
 
 
 def compute_volume_ratio(df: pd.DataFrame, period: int = 20) -> pd.DataFrame:
+    """Volume ratio vs rolling average — measures relative activity."""
     df = df.copy()
     df["vol_avg"] = df["volume"].rolling(period).mean()
-    df["vol_ratio"] = df["volume"] / df["vol_avg"]
+    df["vol_ratio"] = df["volume"] / df["vol_avg"].replace(0, np.nan)
     return df
 
 
 def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply all intraday indicators to a 5-min bar DataFrame."""
     df = compute_emas(df)
     df = compute_rsi(df)
-    df = compute_macd(df)
     df = compute_atr(df)
-    df = compute_roc(df)
     df = compute_vwap(df)
     df = compute_volume_ratio(df)
     return df
 
 
 # ---------------------------------------------------------------------------
-# Pattern detection (operates on last few candles)
+# VWAP Reclaim pattern detection
 # ---------------------------------------------------------------------------
 
-def is_bullish_engulfing(df: pd.DataFrame) -> bool:
-    """Last candle engulfs the previous bearish candle."""
-    if len(df) < 2:
-        return False
-    prev = df.iloc[-2]
+def detect_vwap_reclaim(df: pd.DataFrame) -> dict:
+    """
+    Detect a VWAP reclaim setup on the most recent candle.
+
+    Conditions:
+      1. Previous candle closed BELOW VWAP (the dip)
+      2. Current candle closes ABOVE VWAP (the reclaim)
+      3. Current candle is bullish (close > open)
+
+    Returns dict with detected flag and details.
+    """
+    if len(df) < 3:
+        return {"detected": False, "reason": "insufficient_bars"}
+
     curr = df.iloc[-1]
-    prev_bearish = prev["close"] < prev["open"]
+    prev = df.iloc[-2]
+
+    prev_below_vwap = prev["close"] < prev["vwap"]
+    curr_above_vwap = curr["close"] > curr["vwap"]
     curr_bullish = curr["close"] > curr["open"]
-    engulfs = curr["open"] <= prev["close"] and curr["close"] >= prev["open"]
-    return bool(prev_bearish and curr_bullish and engulfs)
 
+    if prev_below_vwap and curr_above_vwap and curr_bullish:
+        vwap_reclaim_size = curr["close"] - curr["vwap"]
+        return {
+            "detected": True,
+            "vwap": round(curr["vwap"], 2),
+            "close": round(curr["close"], 2),
+            "reclaim_size": round(vwap_reclaim_size, 2),
+            "prev_close": round(prev["close"], 2),
+        }
 
-def is_inside_bar_breakout(df: pd.DataFrame) -> bool:
-    """Current bar breaks above the high of an inside bar."""
-    if len(df) < 3:
-        return False
-    two_back = df.iloc[-3]
-    prev = df.iloc[-2]
-    curr = df.iloc[-1]
-    inside = prev["high"] < two_back["high"] and prev["low"] > two_back["low"]
-    breakout = curr["close"] > two_back["high"]
-    return bool(inside and breakout)
+    reason = []
+    if not prev_below_vwap:
+        reason.append("prev_not_below_vwap")
+    if not curr_above_vwap:
+        reason.append("curr_not_above_vwap")
+    if not curr_bullish:
+        reason.append("curr_not_bullish")
 
-
-def is_higher_highs_higher_lows(df: pd.DataFrame, lookback: int = 5) -> bool:
-    """Recent swing structure shows HH/HL."""
-    if len(df) < lookback:
-        return False
-    recent = df.tail(lookback)
-    highs = recent["high"].values
-    lows = recent["low"].values
-    hh = all(highs[i] >= highs[i - 1] for i in range(1, len(highs)))
-    hl = all(lows[i] >= lows[i - 1] for i in range(1, len(lows)))
-    return bool(hh and hl)
-
-
-def is_morning_star(df: pd.DataFrame) -> bool:
-    """
-    Morning Star (3-candle reversal):
-    1. Large bearish candle
-    2. Small-bodied candle (star) that gaps down — indecision
-    3. Large bullish candle that closes into the body of candle 1
-    """
-    if len(df) < 3:
-        return False
-    c1 = df.iloc[-3]  # large bearish
-    c2 = df.iloc[-2]  # small star
-    c3 = df.iloc[-1]  # large bullish
-
-    c1_bearish = c1["close"] < c1["open"]
-    c1_body = abs(c1["open"] - c1["close"])
-
-    c2_body = abs(c2["open"] - c2["close"])
-    c2_small = c2_body < c1_body * 0.3  # star body is small relative to c1
-
-    c3_bullish = c3["close"] > c3["open"]
-    c3_body = abs(c3["open"] - c3["close"])
-    c3_recovers = c3["close"] >= c1["open"] + (c1["close"] - c1["open"]) * 0.5  # closes into c1 body
-
-    return bool(c1_bearish and c2_small and c3_bullish and c3_recovers and c3_body > c1_body * 0.5)
-
-
-def is_three_white_soldiers(df: pd.DataFrame) -> bool:
-    """
-    Three White Soldiers (3-candle continuation/reversal):
-    - Three consecutive bullish candles
-    - Each opens within the prior candle's body
-    - Each closes higher than the prior close
-    - Each has a relatively small upper wick (not exhaustion)
-    """
-    if len(df) < 3:
-        return False
-    c1 = df.iloc[-3]
-    c2 = df.iloc[-2]
-    c3 = df.iloc[-1]
-
-    # All three bullish
-    if not (c1["close"] > c1["open"] and
-            c2["close"] > c2["open"] and
-            c3["close"] > c3["open"]):
-        return False
-
-    # Each opens within prior body
-    c2_opens_in_c1 = c1["open"] <= c2["open"] <= c1["close"]
-    c3_opens_in_c2 = c2["open"] <= c3["open"] <= c2["close"]
-
-    # Each closes higher
-    ascending = c2["close"] > c1["close"] and c3["close"] > c2["close"]
-
-    # Upper wicks not too long (< 25% of body) — avoids exhaustion candles
-    def wick_ok(c):
-        body = c["close"] - c["open"]
-        upper_wick = c["high"] - c["close"]
-        return body > 0 and upper_wick < body * 0.25
-
-    return bool(c2_opens_in_c1 and c3_opens_in_c2 and ascending and
-                wick_ok(c1) and wick_ok(c2) and wick_ok(c3))
-
-
-def detect_pattern(df: pd.DataFrame) -> str:
-    """Returns the strongest pattern detected, or 'none'."""
-    if is_morning_star(df):
-        return "morning_star"
-    if is_three_white_soldiers(df):
-        return "three_white_soldiers"
-    if is_bullish_engulfing(df):
-        return "bullish_engulfing"
-    if is_inside_bar_breakout(df):
-        return "inside_bar_breakout"
-    if is_higher_highs_higher_lows(df):
-        return "higher_highs_higher_lows"
-    return "none"
+    return {"detected": False, "reason": "+".join(reason)}
 
 
 # ---------------------------------------------------------------------------
-# Composite signal scoring
+# Composite intraday signal scoring
 # ---------------------------------------------------------------------------
 
-def score_setup(df: pd.DataFrame, news_sentiment: str = "neutral") -> dict:
+def score_intraday_setup(df: pd.DataFrame, news_sentiment: str = "neutral") -> dict:
     """
-    Score a swing trade setup. Returns a dict with score and all signal values.
-    Minimum score of 5 required to qualify as a trade candidate.
+    Score a VWAP reclaim day trading setup on 5-min bars.
+    Returns a dict with score, qualified flag, and all signal values.
+
+    Minimum score of 4 required to qualify.
 
     Scoring:
-      RSI 40-55 turning up          +2  (required zone for pullback entry)
-      MACD histogram turning pos    +2
-      ROC > 5%                      +1
-      Price above VWAP              +1
-      Bullish candle pattern        +2
-      Volume above avg on signal    +1
-      Positive news sentiment       +1
-      HH/HL structure               +1
+      VWAP reclaim (prev below, curr above, bullish candle)  +3  [required]
+      EMA9 > EMA20 (intraday uptrend)                        +2
+      RSI 40–68 (not overbought, has room to run)            +1
+      Volume on reclaim candle > 20-bar avg                  +2
+      Positive news sentiment                                +1
+      -------------------------------------------------------
+      Max score: 9
+      Minimum to qualify: 4
     """
-    if len(df) < 52:  # need enough bars for 50 EMA
+    min_bars = 25  # need enough bars for EMA20 + volume avg
+    if len(df) < min_bars:
         return {"score": 0, "qualified": False, "reason": "insufficient_bars"}
 
+    # Ensure indicators are computed
+    if "vwap" not in df.columns:
+        df = add_all_indicators(df)
+
     row = df.iloc[-1]
-    prev_row = df.iloc[-2]
 
-    # --- Hard requirements (disqualify if not met) ---
-    uptrend = row["ema20"] > row["ema50"]
-    if not uptrend:
-        return {"score": 0, "qualified": False, "reason": "no_uptrend"}
+    # --- Hard requirement: VWAP reclaim must be present ---
+    reclaim = detect_vwap_reclaim(df)
+    if not reclaim["detected"]:
+        return {
+            "score": 0,
+            "qualified": False,
+            "reason": f"no_vwap_reclaim:{reclaim.get('reason', '')}",
+        }
 
-    # Price near 20 EMA (within 2%)
-    ema_distance_pct = abs(row["close"] - row["ema20"]) / row["ema20"] * 100
-    near_ema = ema_distance_pct <= 2.0
-    if not near_ema:
-        return {"score": 0, "qualified": False, "reason": "price_not_near_ema20",
-                "ema_distance_pct": round(ema_distance_pct, 2)}
+    score = 3  # base score for the reclaim itself
+    signals = {
+        "vwap_reclaim": {
+            "vwap": reclaim["vwap"],
+            "close": reclaim["close"],
+            "reclaim_size": reclaim["reclaim_size"],
+            "points": 3,
+        }
+    }
 
-    score = 0
-    signals = {}
+    # EMA9 > EMA20 — intraday trend is up
+    ema_uptrend = row["ema_fast"] > row["ema_slow"]
+    if ema_uptrend:
+        score += 2
+        signals["ema_trend"] = {
+            "ema9": round(row["ema_fast"], 2),
+            "ema20": round(row["ema_slow"], 2),
+            "signal": "uptrend",
+            "points": 2,
+        }
+    else:
+        signals["ema_trend"] = {
+            "ema9": round(row["ema_fast"], 2),
+            "ema20": round(row["ema_slow"], 2),
+            "signal": "downtrend",
+            "points": 0,
+        }
 
-    # RSI in pullback zone and turning up
+    # RSI in healthy range — not overbought
     rsi = row["rsi"]
-    prev_rsi = prev_row["rsi"]
-    rsi_in_zone = 40 <= rsi <= 55
-    rsi_turning_up = rsi > prev_rsi
-    if rsi_in_zone and rsi_turning_up:
-        score += 2
-        signals["rsi"] = {"value": round(rsi, 1), "signal": "pullback_zone_turning_up", "points": 2}
-    else:
-        signals["rsi"] = {"value": round(rsi, 1), "signal": "neutral", "points": 0}
-
-    # MACD histogram turning positive
-    macd_hist = row["macd_hist"]
-    prev_macd_hist = prev_row["macd_hist"]
-    macd_turning = macd_hist > prev_macd_hist and macd_hist > -0.5
-    if macd_turning:
-        score += 2
-        signals["macd"] = {"histogram": round(macd_hist, 4), "signal": "turning_positive", "points": 2}
-    else:
-        signals["macd"] = {"histogram": round(macd_hist, 4), "signal": "neutral", "points": 0}
-
-    # ROC momentum
-    roc = row.get("roc", 0)
-    if roc and roc > 5:
+    rsi_ok = 40 <= rsi <= 68
+    if rsi_ok:
         score += 1
-        signals["roc"] = {"value": round(roc, 2), "signal": "strong_momentum", "points": 1}
+        signals["rsi"] = {"value": round(rsi, 1), "signal": "healthy_range", "points": 1}
     else:
-        signals["roc"] = {"value": round(roc, 2) if roc else 0, "signal": "weak", "points": 0}
+        signals["rsi"] = {
+            "value": round(rsi, 1),
+            "signal": "overbought" if rsi > 68 else "oversold",
+            "points": 0,
+        }
 
-    # Price vs VWAP
-    above_vwap = row["close"] > row["vwap"]
-    if above_vwap:
-        score += 1
-        signals["vwap"] = {"signal": "above", "points": 1}
-    else:
-        signals["vwap"] = {"signal": "below", "points": 0}
-
-    # Pattern
-    pattern = detect_pattern(df)
-    if pattern in ("bullish_engulfing", "inside_bar_breakout", "morning_star", "three_white_soldiers"):
-        score += 2
-        signals["pattern"] = {"detected": pattern, "points": 2}
-    elif pattern == "higher_highs_higher_lows":
-        score += 1
-        signals["pattern"] = {"detected": pattern, "points": 1}
-    else:
-        signals["pattern"] = {"detected": "none", "points": 0}
-
-    # Volume confirmation
+    # Volume confirmation on reclaim candle
     vol_ratio = row.get("vol_ratio", 1.0)
-    if vol_ratio and vol_ratio > 1.2:
+    if pd.isna(vol_ratio):
+        vol_ratio = 1.0
+    if vol_ratio >= 1.5:
+        score += 2
+        signals["volume"] = {
+            "ratio": round(vol_ratio, 2),
+            "signal": "strong_confirmation",
+            "points": 2,
+        }
+    elif vol_ratio >= 1.0:
         score += 1
-        signals["volume"] = {"ratio": round(vol_ratio, 2), "signal": "above_avg", "points": 1}
+        signals["volume"] = {
+            "ratio": round(vol_ratio, 2),
+            "signal": "above_avg",
+            "points": 1,
+        }
     else:
-        signals["volume"] = {"ratio": round(vol_ratio, 2) if vol_ratio else 1.0, "signal": "below_avg", "points": 0}
+        signals["volume"] = {
+            "ratio": round(vol_ratio, 2),
+            "signal": "weak",
+            "points": 0,
+        }
 
-    # News sentiment
+    # News sentiment bonus
     if news_sentiment == "positive":
         score += 1
         signals["news"] = {"sentiment": "positive", "points": 1}
     else:
         signals["news"] = {"sentiment": news_sentiment, "points": 0}
 
-    # HH/HL structure
-    if is_higher_highs_higher_lows(df):
-        score += 1
-        signals["structure"] = {"signal": "hh_hl", "points": 1}
-    else:
-        signals["structure"] = {"signal": "neutral", "points": 0}
-
     return {
         "score": score,
-        "qualified": score >= 5,
+        "qualified": score >= 4,
         "signals": signals,
         "close": round(row["close"], 2),
-        "ema20": round(row["ema20"], 2),
-        "ema50": round(row["ema50"], 2),
-        "atr": round(row["atr"], 2),
+        "vwap": round(row["vwap"], 2),
+        "ema_fast": round(row["ema_fast"], 2),
+        "ema_slow": round(row["ema_slow"], 2),
+        "atr": round(row["atr"], 4),
         "rsi": round(rsi, 1),
-        "pattern": pattern,
-        "ema_distance_pct": round(ema_distance_pct, 2),
+        "vol_ratio": round(vol_ratio, 2),
     }
 
 
@@ -328,28 +270,28 @@ def score_setup(df: pd.DataFrame, news_sentiment: str = "neutral") -> dict:
 # ---------------------------------------------------------------------------
 
 def calculate_entry_levels(score_result: dict, max_position_size: float = 5000.0) -> dict:
-    """Calculate entry, stop, target, and position size."""
+    """
+    Calculate intraday entry, stop, target, and position size.
+
+    Stop: 0.5x ATR below the entry candle low (tight intraday stop)
+    Target: 1.5:1 R:R
+    """
     close = score_result["close"]
     atr = score_result["atr"]
-    ema20 = score_result["ema20"]
 
-    # Stop below the pullback low (1x ATR below EMA20)
-    stop_loss = round(ema20 - atr, 2)
+    # Stop below entry candle low — use 0.5x ATR as buffer
+    stop_loss = round(close - (0.5 * atr), 2)
     risk_per_share = round(close - stop_loss, 2)
 
     if risk_per_share <= 0:
         return {}
 
-    # Take profit at 2x risk
-    take_profit = round(close + (2 * risk_per_share), 2)
+    # 1.5:1 reward:risk
+    take_profit = round(close + (1.5 * risk_per_share), 2)
 
-    # Trailing stop activates at 1x risk, trails by 1x ATR
-    trailing_stop_activation = round(close + risk_per_share, 2)
-
-    # Position sizing: risk 1% of max position or max_position_size shares
-    shares = int(min(max_position_size / close, max_position_size / close))
-    # Cap by max position size
-    shares = min(shares, int(max_position_size / close))
+    # Position sizing: max notional / entry price, capped at max_position_size
+    shares = int(max_position_size / close)
+    shares = max(shares, 1)
     notional = round(shares * close, 2)
 
     return {
@@ -357,44 +299,64 @@ def calculate_entry_levels(score_result: dict, max_position_size: float = 5000.0
         "stop_loss": stop_loss,
         "take_profit": take_profit,
         "risk_per_share": risk_per_share,
-        "trailing_stop_activation_price": trailing_stop_activation,
         "shares": shares,
         "notional": notional,
     }
 
 
 # ---------------------------------------------------------------------------
-# Exit signal detection (for open positions)
+# Intraday exit signal detection
 # ---------------------------------------------------------------------------
 
-def should_exit(df: pd.DataFrame, position: dict) -> dict:
+def should_exit_intraday(df: pd.DataFrame, position: dict) -> dict:
     """
-    Check if an open position should be exited.
+    Check if an open intraday position should be exited early (before force close).
+
+    Exit conditions:
+      1. Price closes below VWAP — setup invalidated
+      2. EMA9 crosses below EMA20 — intraday trend reversed
+      3. RSI > 75 and declining — momentum exhaustion
+
+    Force close at 3:50 PM is handled separately by the execution agent.
     Returns {"exit": bool, "reason": str}
-    Never triggers same-day exit (caller enforces entry_date check).
     """
-    if len(df) < 2:
+    if len(df) < 3:
         return {"exit": False, "reason": "insufficient_data"}
+
+    if "vwap" not in df.columns:
+        df = add_all_indicators(df)
 
     row = df.iloc[-1]
     prev_row = df.iloc[-2]
 
-    # Bearish engulfing
-    prev_bullish = prev_row["close"] > prev_row["open"]
-    curr_bearish = row["close"] < row["open"]
-    engulfs_down = (row["open"] >= prev_row["close"] and row["close"] <= prev_row["open"])
-    if prev_bullish and curr_bearish and engulfs_down:
-        return {"exit": True, "reason": "bearish_engulfing"}
+    # Close below VWAP — setup invalidated
+    if row["close"] < row["vwap"]:
+        return {"exit": True, "reason": "close_below_vwap"}
 
-    # Close below 20 EMA
-    if row["close"] < row["ema20"]:
-        return {"exit": True, "reason": "close_below_ema20"}
+    # EMA9 crossed below EMA20 — intraday trend reversed
+    ema_was_up = prev_row["ema_fast"] > prev_row["ema_slow"]
+    ema_now_down = row["ema_fast"] < row["ema_slow"]
+    if ema_was_up and ema_now_down:
+        return {"exit": True, "reason": "ema_cross_bearish"}
 
-    # RSI overbought + MACD declining
+    # RSI overbought and declining — momentum exhaustion
     rsi = row.get("rsi", 50)
-    macd_hist = row.get("macd_hist", 0)
-    prev_macd_hist = prev_row.get("macd_hist", 0)
-    if rsi > 72 and macd_hist < prev_macd_hist:
-        return {"exit": True, "reason": "rsi_overbought_macd_declining"}
+    prev_rsi = prev_row.get("rsi", 50)
+    if rsi > 75 and rsi < prev_rsi:
+        return {"exit": True, "reason": "rsi_exhaustion"}
 
     return {"exit": False, "reason": "hold"}
+
+
+# ---------------------------------------------------------------------------
+# Daily bar helpers (used by universe/watchlist agents)
+# ---------------------------------------------------------------------------
+
+def compute_atr_daily(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    """ATR on daily bars — used for universe filtering and watchlist scoring."""
+    return compute_atr(df, period)
+
+
+def compute_volume_ratio_daily(df: pd.DataFrame, period: int = 20) -> pd.DataFrame:
+    """Volume ratio on daily bars — used for watchlist scoring."""
+    return compute_volume_ratio(df, period)

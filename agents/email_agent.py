@@ -1,236 +1,290 @@
 """
-Email Agent: Sends daily trading summary via email.
-Runs at 4:15pm ET after market close.
+Email Agent: Sends daily intraday trading summary via email.
+Runs at 4:15 PM ET after market close and force-close.
 """
 import json
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import config
+from logger import get_logger
 
+log = get_logger("email")
+
+ET = ZoneInfo("America/New_York")
+
+
+# ---------------------------------------------------------------------------
+# Data loaders
+# ---------------------------------------------------------------------------
 
 def load_trade_log() -> dict:
-    """Load trade log."""
     try:
-        with open(config.TRADE_LOG_PATH, "r") as f:
+        with open(config.TRADE_LOG_PATH) as f:
             return json.load(f)
     except FileNotFoundError:
         return {"open_positions": {}, "closed_trades": []}
 
 
 def load_strategy_memory() -> dict:
-    """Load strategy memory."""
     try:
-        with open(config.STRATEGY_MEMORY_PATH, "r") as f:
+        with open(config.STRATEGY_MEMORY_PATH) as f:
             return json.load(f)
     except FileNotFoundError:
         return {"trades": [], "strategy_notes": "No trades yet.", "signal_performance": {}}
 
 
-def load_watchlist() -> dict:
-    """Load today's watchlist."""
+def load_intraday_watchlist() -> dict:
     try:
-        with open(config.WATCHLIST_PATH, "r") as f:
+        with open(config.INTRADAY_WATCHLIST_PATH) as f:
             return json.load(f)
     except FileNotFoundError:
-        return {"watchlist": []}
+        return {"stocks": [], "count": 0}
 
 
 def load_candidates() -> dict:
-    """Load today's candidates."""
     try:
-        with open(config.CANDIDATES_PATH, "r") as f:
+        with open(config.CANDIDATES_PATH) as f:
             return json.load(f)
     except FileNotFoundError:
         return {"candidates": []}
 
 
-def format_email_body(log: dict, memory: dict, watchlist: dict, candidates: dict) -> str:
-    """Format the email body with trading summary."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    
-    # Count today's activity
-    trades_opened_today = sum(1 for pos in log["open_positions"].values() 
-                              if pos.get("entry_date") == today)
-    trades_closed_today = sum(1 for trade in log["closed_trades"] 
-                              if trade.get("exit_date") == today)
-    
-    # Calculate today's P&L
-    todays_pnl = sum(trade.get("pnl", 0) for trade in log["closed_trades"] 
-                     if trade.get("exit_date") == today)
-    
-    # Build email
+# ---------------------------------------------------------------------------
+# Email formatting
+# ---------------------------------------------------------------------------
+
+def format_email_body(
+    trade_log: dict,
+    memory: dict,
+    intraday_watchlist: dict,
+    candidates: dict,
+) -> str:
+    today = datetime.now(tz=ET).strftime("%Y-%m-%d")
+
+    # Today's closed trades
+    todays_closed = [
+        t for t in trade_log["closed_trades"]
+        if t.get("exit_date") == today
+    ]
+
+    # P&L — only count trades that have actual pnl recorded
+    todays_pnl = sum(t.get("pnl", 0) for t in todays_closed)
+    wins_today = sum(1 for t in todays_closed if t.get("outcome") == "win")
+    losses_today = sum(1 for t in todays_closed if t.get("outcome") == "loss")
+
+    # In-play stocks today
+    inplay_stocks = intraday_watchlist.get("stocks", [])
+    inplay_symbols = [s["symbol"] for s in inplay_stocks]
+
     body = f"""
-Stock Trading Agent - Daily Summary
+Day Trading Agent — Daily Summary
 Date: {today}
 
 ═══════════════════════════════════════════════════════════
 
 📊 TODAY'S ACTIVITY
 
-Watchlist Scanned: {len(watchlist.get('watchlist', []))} stocks
-Trade Candidates Found: {len(candidates.get('candidates', []))}
-New Positions Opened: {trades_opened_today}
-Positions Closed: {trades_closed_today}
-Open Positions: {len(log['open_positions'])}
-
+In-Play Stocks Scanned: {len(inplay_symbols)} ({', '.join(inplay_symbols) or 'none'})
+VWAP Reclaim Setups Found: {len(candidates.get('candidates', []))}
+Trades Closed Today: {len(todays_closed)}
 """
 
-    # Today's P&L
-    if trades_closed_today > 0:
-        body += f"\n💰 TODAY'S P&L: ${todays_pnl:,.2f}\n"
-    else:
-        body += "\n💰 TODAY'S P&L: No trades closed today\n"
+    if todays_closed:
+        win_rate_today = (wins_today / len(todays_closed) * 100) if todays_closed else 0
+        body += f"  Wins: {wins_today}  |  Losses: {losses_today}  |  Win Rate: {win_rate_today:.0f}%\n"
 
-    # Trades opened today
-    if trades_opened_today > 0:
-        body += "\n\n📈 TRADES OPENED TODAY:\n\n"
-        for symbol, pos in log["open_positions"].items():
-            if pos.get("entry_date") == today:
-                body += f"  • {symbol}\n"
-                body += f"    Entry: ${pos.get('entry', 0):.2f}\n"
-                body += f"    Shares: {pos.get('shares', 0)}\n"
-                body += f"    Stop: ${pos.get('stop_loss', 0):.2f}\n"
-                body += f"    Target: ${pos.get('take_profit', 0):.2f}\n"
-                body += f"    Reasoning: {pos.get('reasoning', 'N/A')}\n\n"
-    
-    # Trades closed today
-    if trades_closed_today > 0:
-        body += "\n\n📉 TRADES CLOSED TODAY:\n\n"
-        for trade in log["closed_trades"]:
-            if trade.get("exit_date") == today:
-                pnl = trade.get("pnl", 0)
-                pnl_pct = trade.get("pnl_pct", 0)
-                outcome = "✅ WIN" if pnl > 0 else "❌ LOSS"
-                
-                body += f"  • {trade.get('symbol', 'N/A')} - {outcome}\n"
-                body += f"    Entry: ${trade.get('entry_price', 0):.2f} → Exit: ${trade.get('exit_price', 0):.2f}\n"
-                body += f"    P&L: ${pnl:,.2f} ({pnl_pct:.2f}%)\n"
-                body += f"    Exit Reason: {trade.get('exit_reason', 'N/A')}\n\n"
-    
-    # Open positions
-    if log["open_positions"]:
-        body += "\n\n📊 CURRENT OPEN POSITIONS:\n\n"
-        for symbol, pos in log["open_positions"].items():
-            body += f"  • {symbol}\n"
-            body += f"    Entry: ${pos.get('entry', 0):.2f} on {pos.get('entry_date', 'N/A')}\n"
-            body += f"    Shares: {pos.get('shares', 0)}\n\n"
-    
-    # Strategy insights
-    body += "\n\n🧠 WHAT I LEARNED TODAY:\n\n"
-    
-    # Get latest strategy notes
+    # Today's P&L
+    if todays_closed:
+        pnl_emoji = "💰" if todays_pnl >= 0 else "🔴"
+        body += f"\n{pnl_emoji} TODAY'S P&L: ${todays_pnl:,.2f}\n"
+    else:
+        body += "\n💤 TODAY'S P&L: No trades today\n"
+
+    # Trades closed today — detailed
+    if todays_closed:
+        body += "\n\n📋 TRADES CLOSED TODAY:\n\n"
+        for trade in todays_closed:
+            pnl = trade.get("pnl", 0)
+            outcome = trade.get("outcome", "unknown")
+            if outcome == "win":
+                outcome_icon = "✅ WIN"
+            elif outcome == "loss":
+                outcome_icon = "❌ LOSS"
+            else:
+                outcome_icon = "⏹ CLOSED"
+
+            entry_price = trade.get("entry_price", trade.get("entry", 0))
+            exit_price = trade.get("exit_price", 0)
+            pnl_pct = trade.get("pnl_pct", 0)
+
+            body += f"  • {trade.get('symbol', '?')} — {outcome_icon}\n"
+            body += f"    Entry: ${entry_price:.2f} at {trade.get('entry_time', '?')}\n"
+            if exit_price:
+                body += f"    Exit:  ${exit_price:.2f} at {trade.get('exit_time', '?')}\n"
+            if pnl:
+                body += f"    P&L:   ${pnl:,.2f}"
+                if pnl_pct:
+                    body += f" ({pnl_pct:.2f}%)"
+                body += "\n"
+            body += f"    Exit Reason: {trade.get('exit_reason', 'N/A')}\n"
+
+            # Show key signals at entry
+            signals = trade.get("signals_at_entry", {})
+            if signals:
+                fired = [
+                    name for name, data in signals.items()
+                    if isinstance(data, dict) and data.get("points", 0) > 0
+                ]
+                if fired:
+                    body += f"    Signals: {', '.join(fired)}\n"
+
+            # Intraday context
+            gap = trade.get("gap_pct")
+            vol_ratio = trade.get("open_vol_ratio")
+            vwap = trade.get("vwap_at_entry")
+            if gap is not None:
+                body += f"    Gap: {gap:+.2f}%"
+                if vol_ratio is not None:
+                    body += f"  |  Opening Vol: {vol_ratio:.1f}x avg"
+                if vwap is not None:
+                    body += f"  |  VWAP at entry: ${vwap:.2f}"
+                body += "\n"
+
+            reasoning = trade.get("reasoning", "")
+            if reasoning:
+                body += f"    Note: {reasoning[:120]}\n"
+            body += "\n"
+
+    # Any positions still open (shouldn't happen after force close, but just in case)
+    if trade_log["open_positions"]:
+        body += "\n⚠️  POSITIONS STILL OPEN (force close may have failed):\n\n"
+        for symbol, pos in trade_log["open_positions"].items():
+            body += f"  • {symbol} — {pos.get('shares', 0)} shares @ ${pos.get('entry', 0):.2f}\n"
+            body += f"    Entered: {pos.get('entry_date', '?')} {pos.get('entry_time', '')}\n\n"
+
+    # Strategy insights from memory
+    body += "\n\n🧠 STRATEGY INSIGHTS:\n\n"
     strategy_notes = memory.get("strategy_notes", "No insights yet.")
     body += f"{strategy_notes}\n"
-    
-    # Signal performance summary
+
+    # Signal performance
     if memory.get("signal_performance"):
         body += "\n\n📈 SIGNAL PERFORMANCE (All Time):\n\n"
         perf = memory["signal_performance"]
-        # Show top 3 best performing signals
-        sorted_signals = sorted(perf.items(), 
-                               key=lambda x: x[1]["wins"] / (x[1]["wins"] + x[1]["losses"]) if (x[1]["wins"] + x[1]["losses"]) > 0 else 0,
-                               reverse=True)[:3]
-        
+        sorted_signals = sorted(
+            perf.items(),
+            key=lambda x: (
+                x[1]["wins"] / (x[1]["wins"] + x[1]["losses"])
+                if (x[1]["wins"] + x[1]["losses"]) > 0 else 0
+            ),
+            reverse=True,
+        )[:5]
+
         for signal, stats in sorted_signals:
             total = stats["wins"] + stats["losses"]
             if total > 0:
                 win_rate = (stats["wins"] / total) * 100
-                body += f"  • {signal}: {stats['wins']}W / {stats['losses']}L ({win_rate:.1f}% win rate)\n"
-    
+                body += (
+                    f"  • {signal}: "
+                    f"{stats['wins']}W / {stats['losses']}L "
+                    f"({win_rate:.1f}% win rate, {total} trades)\n"
+                )
+
     # Overall stats
-    total_trades = len(memory.get("trades", []))
-    if total_trades > 0:
-        wins = sum(1 for t in memory["trades"] if t.get("outcome") == "win")
-        win_rate = (wins / total_trades) * 100
-        total_pnl = sum(t.get("pnl", 0) for t in memory["trades"])
-        
-        body += f"\n\n📊 OVERALL STATS:\n\n"
-        body += f"  Total Trades: {total_trades}\n"
-        body += f"  Win Rate: {win_rate:.1f}%\n"
+    all_trades = memory.get("trades", [])
+    if all_trades:
+        total = len(all_trades)
+        wins = sum(1 for t in all_trades if t.get("outcome") == "win")
+        win_rate = (wins / total * 100) if total > 0 else 0
+        total_pnl = sum(t.get("pnl", 0) for t in all_trades)
+
+        body += f"\n\n📊 OVERALL STATS ({total} trades):\n\n"
+        body += f"  Win Rate:  {win_rate:.1f}%\n"
         body += f"  Total P&L: ${total_pnl:,.2f}\n"
-    
+
     body += "\n\n═══════════════════════════════════════════════════════════\n"
-    body += "\nThis is an automated report from your Stock Trading Agent.\n"
-    body += f"Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S ET')}\n"
-    
+    body += "Automated report from your Day Trading Agent.\n"
+    body += f"Strategy: VWAP Reclaim | 5-min bars | 1.5:1 R:R | Force close 3:50 PM ET\n"
+    body += f"Generated: {datetime.now(tz=ET).strftime('%Y-%m-%d %H:%M ET')}\n"
+
     return body
 
 
+# ---------------------------------------------------------------------------
+# SMTP send
+# ---------------------------------------------------------------------------
+
 def send_email(to_email: str, subject: str, body: str) -> bool:
-    """Send email via SMTP."""
-    from_email = config.EMAIL_FROM
-    smtp_server = config.SMTP_SERVER
-    smtp_port = config.SMTP_PORT
-    smtp_user = config.SMTP_USER
-    smtp_password = config.SMTP_PASSWORD
-    
-    if not all([from_email, smtp_server, smtp_user, smtp_password]):
-        print("  Warning: Email credentials not configured in .env")
-        print("  Skipping email send. Configure SMTP settings to enable email reports.")
-        return False
-    
-    try:
-        # Create message
-        msg = MIMEMultipart()
-        msg['From'] = from_email
-        msg['To'] = to_email
-        msg['Subject'] = subject
-        
-        msg.attach(MIMEText(body, 'plain'))
-        
-        # Send via SMTP
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_password)
-            server.send_message(msg)
-        
-        return True
-    
-    except Exception as e:
-        print(f"  Error sending email: {e}")
+    if not all([config.EMAIL_FROM, config.SMTP_SERVER, config.SMTP_USER, config.SMTP_PASSWORD]):
+        log.warning("Email credentials not fully configured in .env — skipping send")
         return False
 
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = config.EMAIL_FROM
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+
+        with smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT) as server:
+            server.starttls()
+            server.login(config.SMTP_USER, config.SMTP_PASSWORD)
+            server.send_message(msg)
+
+        return True
+
+    except Exception as e:
+        log.error(f"Email send failed: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def run():
     """Main email agent logic."""
-    print(f"[{datetime.now()}] Email Agent: Generating daily summary...")
-    
-    # Load all data
-    log = load_trade_log()
+    log.info("=" * 60)
+    log.info("EMAIL AGENT STARTING")
+    log.info("=" * 60)
+
+    trade_log = load_trade_log()
     memory = load_strategy_memory()
-    watchlist = load_watchlist()
+    intraday_watchlist = load_intraday_watchlist()
     candidates = load_candidates()
-    
-    # Format email
-    subject = f"Stock Trading Agent - Daily Summary {datetime.now().strftime('%Y-%m-%d')}"
-    body = format_email_body(log, memory, watchlist, candidates)
-    
-    # Send email
-    to_email = config.EMAIL_TO
-    
-    if not to_email:
-        print("  Warning: EMAIL_TO not set in config. Skipping email.")
-        print("\n" + "="*60)
-        print("DAILY SUMMARY (would be emailed):")
-        print("="*60)
+
+    today = datetime.now(tz=ET).strftime("%Y-%m-%d")
+    todays_closed = [t for t in trade_log["closed_trades"] if t.get("exit_date") == today]
+    todays_pnl = sum(t.get("pnl", 0) for t in todays_closed)
+
+    subject = (
+        f"Day Trading Agent — {today} | "
+        f"{len(todays_closed)} trades | "
+        f"P&L: ${todays_pnl:+,.2f}"
+    )
+
+    body = format_email_body(trade_log, memory, intraday_watchlist, candidates)
+
+    if not config.EMAIL_TO:
+        log.warning("EMAIL_TO not set — printing summary instead")
+        print("\n" + "=" * 60)
         print(body)
-        print("="*60)
+        print("=" * 60)
         return
-    
-    print(f"  Sending daily summary to {to_email}...")
-    success = send_email(to_email, subject, body)
-    
+
+    log.info(f"Sending daily summary to {config.EMAIL_TO}...")
+    success = send_email(config.EMAIL_TO, subject, body)
+
     if success:
-        print(f"[{datetime.now()}] Email Agent: Daily summary sent successfully")
+        log.info(f"Daily summary sent successfully to {config.EMAIL_TO}")
     else:
-        print(f"[{datetime.now()}] Email Agent: Failed to send email")
-        print("\n" + "="*60)
-        print("DAILY SUMMARY (email failed):")
-        print("="*60)
-        print(body)
-        print("="*60)
+        log.warning("Email send failed — printing summary to log")
+        log.info("\n" + body)
+
+    log.info("EMAIL AGENT COMPLETE")
 
 
 if __name__ == "__main__":

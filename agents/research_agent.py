@@ -173,7 +173,7 @@ Return ONLY a valid JSON array, no other text."""
 
     try:
         response = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model=config.ANTHROPIC_MODEL,
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
             system=[{
