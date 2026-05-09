@@ -1,7 +1,7 @@
 # Project Structure
 
 ```
-stock-agent/
+algo_trading_bot/
 ├── .env                      # API keys (gitignored)
 ├── .gitignore
 ├── requirements.txt
