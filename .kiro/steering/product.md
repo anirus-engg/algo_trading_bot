@@ -12,12 +12,13 @@ via Alpaca, and force-closes all positions by 3:50 PM ET. Learns from P&L to imp
 
 - Weekly universe refresh: S&P 500 filtered by price ≥ $20, ATR% ≥ 1.5%, top 100 by dollar volume
 - Daily watchlist: top 25 from universe by ATR%/volume (8:00 AM)
-- Pre-market gap filter: narrows to "in play" stocks via quote API (9:15 AM)
-- Opening volume confirm: first 5-min bar vs 20-day average (9:35 AM)
-- VWAP reclaim signal scoring: EMA9/20 trend + RSI + volume confirmation
-- Bracket order execution: 0.5x ATR stop, 1.5:1 R:R target
+- Dual strategy scoring every 5 min on all 25 watchlist stocks:
+  - **VWAP Reclaim**: price dips below VWAP then reclaims it with volume
+  - **ORB Breakout**: price breaks above the 9:30–9:45 AM opening range high with volume
+- Best qualifying setup per stock wins (higher score takes priority)
+- Bracket order execution: setup-specific stops, 1.5:1 R:R target
 - Force close at 3:50 PM ET — no overnight holds
-- Self-learning memory system that evolves strategy based on same-day results
+- Self-learning memory system that tracks performance by setup type
 - Paper trading only (experimental, not real money)
 
 ## Strategy Parameters

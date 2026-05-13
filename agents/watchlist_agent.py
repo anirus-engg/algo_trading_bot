@@ -13,6 +13,7 @@ Stage 2 — Pre-market / open filter (runs 9:15 AM gap check + 9:35 AM volume co
 """
 import json
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta, date, time as dtime
 from zoneinfo import ZoneInfo
 from alpaca.data.historical import StockHistoricalDataClient
@@ -26,6 +27,20 @@ from logger import get_logger
 log = get_logger("watchlist")
 
 ET = ZoneInfo("America/New_York")
+
+
+class _NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy scalar types."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
 
 
 # ---------------------------------------------------------------------------
@@ -90,12 +105,12 @@ def score_stock_daily(symbol: str, df: pd.DataFrame) -> dict:
 
     return {
         "symbol": symbol,
-        "score": round(total_score, 2),
-        "vol_ratio": round(vol_ratio, 2),
-        "atr_pct": round(atr_pct, 2),
+        "score": float(round(total_score, 2)),
+        "vol_ratio": float(round(vol_ratio, 2)),
+        "atr_pct": float(round(atr_pct, 2)),
         "dollar_volume": int(dollar_volume),
-        "close": round(row["close"], 2),
-        "prior_close": round(row["close"], 2),  # used by gap filter
+        "close": float(round(row["close"], 2)),
+        "prior_close": float(round(row["close"], 2)),  # used by gap filter
     }
 
 
@@ -162,7 +177,7 @@ def run_daily_watchlist() -> list:
     }
 
     with open(config.WATCHLIST_PATH, "w") as f:
-        json.dump(output, f, indent=2)
+        json.dump(output, f, indent=2, cls=_NumpyEncoder)
 
     log.info(f"Watchlist saved to {config.WATCHLIST_PATH}")
     log.info("WATCHLIST AGENT — STAGE 1 COMPLETE")
@@ -179,6 +194,10 @@ def fetch_latest_quotes(symbols: list) -> dict:
     Works on Alpaca Basic (free) plan.
     Returns {symbol: latest_price}
     """
+    if not symbols:
+        log.debug("fetch_latest_quotes called with empty symbol list — skipping")
+        return {}
+
     client = StockHistoricalDataClient(config.APCA_API_KEY_ID, config.APCA_API_SECRET_KEY)
     try:
         request = StockLatestQuoteRequest(symbol_or_symbols=symbols)
@@ -222,6 +241,11 @@ def run_gap_filter() -> list:
 
     symbols = [s["symbol"] for s in watchlist]
     prior_closes = {s["symbol"]: s["prior_close"] for s in watchlist}
+
+    if not symbols:
+        log.warning("Watchlist is empty — skipping gap filter. Run daily watchlist scan first.")
+        _save_intraday_watchlist([], stage="gap_filter_skipped_empty_watchlist")
+        return []
 
     log.info(f"Checking gaps for {len(symbols)} symbols...")
     quotes = fetch_latest_quotes(symbols)
@@ -427,7 +451,7 @@ def _save_intraday_watchlist(stocks: list, stage: str = ""):
         "stocks": stocks,
     }
     with open(config.INTRADAY_WATCHLIST_PATH, "w") as f:
-        json.dump(output, f, indent=2)
+        json.dump(output, f, indent=2, cls=_NumpyEncoder)
     log.info(f"Intraday watchlist saved: {len(stocks)} stocks → {config.INTRADAY_WATCHLIST_PATH}")
 
 

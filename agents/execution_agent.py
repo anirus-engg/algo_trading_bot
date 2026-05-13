@@ -146,8 +146,10 @@ def place_bracket_order(client: TradingClient, candidate: dict) -> dict:
     stop_loss = candidate["stop_loss"]
     take_profit = candidate["take_profit"]
 
+    setup_type = candidate.get("setup_type", "vwap_reclaim")
+    setup_label = setup_type.upper().replace("_", " ")
     log.info(
-        f"{symbol}: Placing bracket order — "
+        f"{symbol}: Placing bracket order [{setup_label}] — "
         f"{shares} shares @ ${candidate['entry']} | "
         f"stop=${stop_loss} | target=${take_profit} | "
         f"notional=${candidate['notional']} | "
@@ -166,7 +168,7 @@ def place_bracket_order(client: TradingClient, candidate: dict) -> dict:
         )
 
         order = client.submit_order(order_data)
-        log.info(f"{symbol}: Order submitted — order_id={order.id}")
+        log.info(f"{symbol}: Order submitted — order_id={order.id} | setup={setup_label}")
 
         return {
             "success": True,
@@ -179,17 +181,91 @@ def place_bracket_order(client: TradingClient, candidate: dict) -> dict:
             "take_profit": take_profit,
             "entry_date": str(date.today()),
             "entry_time": datetime.now(tz=ET).strftime("%H:%M"),
+            "setup_type": candidate.get("setup_type", "vwap_reclaim"),
+            "orb_high": candidate.get("orb_high"),
+            "orb_low": candidate.get("orb_low"),
             "reasoning": candidate.get("reasoning", ""),
             "signals": candidate.get("signals", {}),
             "signals_at_entry": candidate.get("signals", {}),
             "score": candidate.get("score", 0),
             "vwap_at_entry": candidate.get("vwap"),
-            "gap_pct": candidate.get("gap_pct"),
-            "open_vol_ratio": candidate.get("open_vol_ratio"),
         }
     except Exception as e:
         log.error(f"{symbol}: Order failed — {e}")
         return {"success": False, "symbol": symbol, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Exit price resolution
+# ---------------------------------------------------------------------------
+
+def fetch_bracket_exit_price(client: TradingClient, position: dict) -> dict | None:
+    """
+    Given a closed position, find the filled sell-side child order on Alpaca
+    and return the actual exit price and whether it was a stop or target fill.
+
+    Bracket orders have a parent order (buy) with two child legs:
+      - take_profit leg (limit sell)
+      - stop_loss leg (stop sell)
+    We look for a filled sell order for the symbol placed after entry.
+    """
+    symbol = position.get("symbol")
+    parent_order_id = position.get("order_id")
+    entry_price = position.get("entry_price", position.get("entry", 0))
+    stop_loss = position.get("stop_loss", 0)
+    take_profit = position.get("take_profit", 0)
+
+    try:
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+
+        # Fetch recent filled orders for this symbol
+        request = GetOrdersRequest(
+            status=QueryOrderStatus.CLOSED,
+            symbols=[symbol],
+            limit=20,
+        )
+        orders = client.get_orders(filter=request)
+
+        # Find filled sell orders that are children of our bracket or match the symbol/time
+        filled_sells = [
+            o for o in orders
+            if (
+                str(o.side).lower() in ("sell", "orderside.sell")
+                and str(o.status).lower() in ("filled", "orderstatus.filled")
+                and o.filled_avg_price is not None
+            )
+        ]
+
+        if not filled_sells:
+            log.debug(f"{symbol}: no filled sell orders found")
+            return None
+
+        # Prefer child orders of our specific bracket order
+        child_fills = [
+            o for o in filled_sells
+            if str(getattr(o, "legs", None) or "") != "None"
+            or str(getattr(o, "order_class", "")) in ("bracket", "oco")
+        ]
+
+        # Pick the most recent filled sell
+        best = sorted(filled_sells, key=lambda o: o.filled_at or o.updated_at, reverse=True)[0]
+        exit_price = float(best.filled_avg_price)
+
+        # Determine if it was a stop or target hit
+        if take_profit and abs(exit_price - take_profit) < abs(exit_price - stop_loss):
+            exit_reason = "target_hit"
+        elif stop_loss and abs(exit_price - stop_loss) <= abs(exit_price - take_profit):
+            exit_reason = "stop_hit"
+        else:
+            exit_reason = "bracket_order_filled"
+
+        log.debug(f"{symbol}: resolved exit_price=${exit_price} via Alpaca order {best.id}")
+        return {"exit_price": exit_price, "exit_reason": exit_reason}
+
+    except Exception as e:
+        log.warning(f"{symbol}: fetch_bracket_exit_price failed — {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -236,8 +312,10 @@ def force_close_all_positions(client: TradingClient, trade_log: dict):
                 side=OrderSide.SELL,
                 time_in_force=TimeInForce.DAY
             )
-            client.submit_order(sell_order)
-            log.info(f"{symbol}: Force-close sell order submitted ({qty} shares)")
+            order = client.submit_order(sell_order)
+            setup_type = trade_log["open_positions"].get(symbol, {}).get("setup_type", "vwap_reclaim")
+            setup_label = setup_type.upper().replace("_", " ")
+            log.info(f"{symbol}: Force-close sell order submitted ({qty} shares) [{setup_label}]")
 
             # Update trade log
             if symbol in trade_log["open_positions"]:
@@ -248,6 +326,25 @@ def force_close_all_positions(client: TradingClient, trade_log: dict):
             closed["exit_date"] = today
             closed["exit_time"] = datetime.now(tz=ET).strftime("%H:%M")
             closed["exit_reason"] = "force_close_eod"
+
+            # Try to get fill price from the submitted order
+            try:
+                import time as _time
+                _time.sleep(1)  # brief wait for fill
+                filled_order = client.get_order_by_id(str(order.id))
+                if filled_order.filled_avg_price:
+                    exit_price = float(filled_order.filled_avg_price)
+                    entry_price = closed.get("entry_price", closed.get("entry", 0))
+                    shares_closed = closed.get("shares", qty)
+                    pnl = (exit_price - entry_price) * shares_closed
+                    closed["exit_price"] = exit_price
+                    closed["pnl"] = round(pnl, 2)
+                    closed["pnl_pct"] = round((exit_price - entry_price) / entry_price * 100, 3) if entry_price else 0
+                    closed["outcome"] = "win" if pnl > 0 else "loss"
+                    log.info(f"{symbol}: force-close fill=${exit_price} | P&L=${pnl:.2f} | outcome={closed['outcome']}")
+            except Exception as fill_err:
+                log.warning(f"{symbol}: could not fetch force-close fill price — {fill_err}")
+
             trade_log["closed_trades"].append(closed)
 
         except Exception as e:
@@ -287,6 +384,26 @@ def check_exit_signals(client: TradingClient, trade_log: dict):
             closed["exit_date"] = today
             closed["exit_time"] = datetime.now(tz=ET).strftime("%H:%M")
             closed["exit_reason"] = "bracket_order_filled"
+
+            # Fetch actual exit fill price from Alpaca order history
+            exit_info = fetch_bracket_exit_price(client, closed)
+            if exit_info:
+                closed["exit_price"] = exit_info["exit_price"]
+                closed["exit_reason"] = exit_info["exit_reason"]
+                entry_price = closed.get("entry_price", closed.get("entry", 0))
+                shares = closed.get("shares", 0)
+                pnl = (exit_info["exit_price"] - entry_price) * shares
+                closed["pnl"] = round(pnl, 2)
+                closed["pnl_pct"] = round((exit_info["exit_price"] - entry_price) / entry_price * 100, 3) if entry_price else 0
+                closed["outcome"] = "win" if pnl > 0 else "loss"
+                log.info(
+                    f"{symbol}: exit_price=${exit_info['exit_price']} | "
+                    f"P&L=${pnl:.2f} | outcome={closed['outcome']} | "
+                    f"reason={closed['exit_reason']}"
+                )
+            else:
+                log.warning(f"{symbol}: could not fetch exit fill price from Alpaca")
+
             trade_log["closed_trades"].append(closed)
 
     if not symbols_to_check:
@@ -310,7 +427,9 @@ def check_exit_signals(client: TradingClient, trade_log: dict):
             exit_signal = should_exit_intraday(df, position_data)
 
             if exit_signal["exit"]:
-                log.info(f"{symbol}: EXIT signal — reason={exit_signal['reason']}")
+                setup_type = position_data.get("setup_type", "vwap_reclaim")
+                setup_label = setup_type.upper().replace("_", " ")
+                log.info(f"{symbol}: EXIT signal [{setup_label}] — reason={exit_signal['reason']}")
                 alpaca_pos = alpaca_positions[symbol]
                 sell_order = MarketOrderRequest(
                     symbol=symbol,
@@ -318,12 +437,31 @@ def check_exit_signals(client: TradingClient, trade_log: dict):
                     side=OrderSide.SELL,
                     time_in_force=TimeInForce.DAY
                 )
-                client.submit_order(sell_order)
+                order = client.submit_order(sell_order)
 
                 closed = trade_log["open_positions"].pop(symbol)
                 closed["exit_date"] = today
                 closed["exit_time"] = datetime.now(tz=ET).strftime("%H:%M")
                 closed["exit_reason"] = exit_signal["reason"]
+
+                # Try to get fill price
+                try:
+                    import time as _time
+                    _time.sleep(1)
+                    filled_order = client.get_order_by_id(str(order.id))
+                    if filled_order.filled_avg_price:
+                        exit_price = float(filled_order.filled_avg_price)
+                        entry_price = closed.get("entry_price", closed.get("entry", 0))
+                        shares_closed = closed.get("shares", abs(float(alpaca_pos.qty)))
+                        pnl = (exit_price - entry_price) * shares_closed
+                        closed["exit_price"] = exit_price
+                        closed["pnl"] = round(pnl, 2)
+                        closed["pnl_pct"] = round((exit_price - entry_price) / entry_price * 100, 3) if entry_price else 0
+                        closed["outcome"] = "win" if pnl > 0 else "loss"
+                        log.info(f"{symbol}: exit fill=${exit_price} | P&L=${pnl:.2f} | outcome={closed['outcome']}")
+                except Exception as fill_err:
+                    log.warning(f"{symbol}: could not fetch exit fill price — {fill_err}")
+
                 trade_log["closed_trades"].append(closed)
                 log.info(f"{symbol}: Sell order submitted")
             else:
@@ -421,7 +559,8 @@ def run():
                 trade_log["open_positions"][symbol] = result
                 buying_power -= candidate["notional"]
                 orders_placed += 1
-                log.info(f"{symbol}: Position opened — {orders_placed}/{slots_available} slots used")
+                setup_label = result.get("setup_type", "vwap_reclaim").upper().replace("_", " ")
+                log.info(f"{symbol}: Position opened [{setup_label}] — {orders_placed}/{slots_available} slots used")
             else:
                 log.error(f"{symbol}: Failed to place order — {result.get('error')}")
 

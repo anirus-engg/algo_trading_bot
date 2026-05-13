@@ -10,9 +10,9 @@ APCA_API_BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.mar
 
 # Anthropic
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-# claude-3-5-haiku-20241022 — fast, cheap (~4x less than Sonnet), good enough for sentiment + memory
-# claude-3-5-sonnet-20241022 — higher quality, use if memory/reasoning quality degrades
-ANTHROPIC_MODEL = "claude-3-5-haiku-20241022"
+# claude-haiku-4-5       — fast, cheap (~4x less than Sonnet), good enough for sentiment + memory
+# claude-sonnet-4-5      — higher quality, use if memory/reasoning quality degrades
+ANTHROPIC_MODEL = "claude-haiku-4-5"
 
 # Email settings
 EMAIL_TO = os.getenv("EMAIL_TO", "aniruddhags@gmail.com")
@@ -50,12 +50,6 @@ OPENING_RANGE_MINUTES = 15
 MIN_STOCK_PRICE = 20.0              # minimum price filter ($)
 MIN_ATR_PCT = 1.5                   # minimum ATR% (daily) for day trading
 UNIVERSE_SIZE = 100                 # top N by avg daily dollar volume
-
-# ---------------------------------------------------------------------------
-# Pre-market / intraday filter
-# ---------------------------------------------------------------------------
-MIN_GAP_PCT = 1.0                   # minimum gap % from prior close to qualify
-MIN_RELATIVE_VOLUME = 1.5           # first 5-min bar volume vs 20-day avg
 
 # ---------------------------------------------------------------------------
 # Intraday bar settings
@@ -103,14 +97,6 @@ WATCHLIST_MINUTE = 0
 # Research / news — after watchlist
 RESEARCH_HOUR = 8
 RESEARCH_MINUTE = 30
-
-# Gap filter — before open (uses quote API, no pre-market bars needed)
-GAP_FILTER_HOUR = 9
-GAP_FILTER_MINUTE = 15
-
-# Volume confirm + strategy prime — after first 5-min bar closes
-VOLUME_CONFIRM_HOUR = 9
-VOLUME_CONFIRM_MINUTE = 35
 
 # Intraday execution polling — every 5 min from 9:45 AM to 3:50 PM
 EXECUTION_INTERVAL_MINUTES = 5

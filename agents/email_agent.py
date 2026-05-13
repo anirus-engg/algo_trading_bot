@@ -79,6 +79,10 @@ def format_email_body(
     inplay_stocks = intraday_watchlist.get("stocks", [])
     inplay_symbols = [s["symbol"] for s in inplay_stocks]
 
+    # Setup type breakdown for today's closed trades
+    vwap_trades = [t for t in todays_closed if t.get("setup_type", "vwap_reclaim") == "vwap_reclaim"]
+    orb_trades = [t for t in todays_closed if t.get("setup_type") == "orb"]
+
     body = f"""
 Day Trading Agent — Daily Summary
 Date: {today}
@@ -88,8 +92,8 @@ Date: {today}
 📊 TODAY'S ACTIVITY
 
 In-Play Stocks Scanned: {len(inplay_symbols)} ({', '.join(inplay_symbols) or 'none'})
-VWAP Reclaim Setups Found: {len(candidates.get('candidates', []))}
-Trades Closed Today: {len(todays_closed)}
+Setups Found: {len(candidates.get('candidates', []))} (VWAP Reclaim: {sum(1 for c in candidates.get('candidates', []) if c.get('setup_type', 'vwap_reclaim') == 'vwap_reclaim')}, ORB: {sum(1 for c in candidates.get('candidates', []) if c.get('setup_type') == 'orb')})
+Trades Closed Today: {len(todays_closed)} (VWAP Reclaim: {len(vwap_trades)}, ORB: {len(orb_trades)})
 """
 
     if todays_closed:
@@ -99,7 +103,17 @@ Trades Closed Today: {len(todays_closed)}
     # Today's P&L
     if todays_closed:
         pnl_emoji = "💰" if todays_pnl >= 0 else "🔴"
-        body += f"\n{pnl_emoji} TODAY'S P&L: ${todays_pnl:,.2f}\n"
+        body += f"\n{pnl_emoji} TODAY'S P&L: ${todays_pnl:,.2f}"
+        # Per-strategy P&L breakdown
+        vwap_pnl = sum(t.get("pnl", 0) for t in vwap_trades)
+        orb_pnl = sum(t.get("pnl", 0) for t in orb_trades)
+        if vwap_trades and orb_trades:
+            body += f"  (VWAP Reclaim: ${vwap_pnl:,.2f} | ORB: ${orb_pnl:,.2f})"
+        elif vwap_trades:
+            body += f"  (VWAP Reclaim)"
+        elif orb_trades:
+            body += f"  (ORB Breakout)"
+        body += "\n"
     else:
         body += "\n💤 TODAY'S P&L: No trades today\n"
 
@@ -120,7 +134,10 @@ Trades Closed Today: {len(todays_closed)}
             exit_price = trade.get("exit_price", 0)
             pnl_pct = trade.get("pnl_pct", 0)
 
-            body += f"  • {trade.get('symbol', '?')} — {outcome_icon}\n"
+            setup_type = trade.get("setup_type", "vwap_reclaim")
+            setup_label = setup_type.upper().replace("_", " ")
+
+            body += f"  • {trade.get('symbol', '?')} [{setup_label}] — {outcome_icon}\n"
             body += f"    Entry: ${entry_price:.2f} at {trade.get('entry_time', '?')}\n"
             if exit_price:
                 body += f"    Exit:  ${exit_price:.2f} at {trade.get('exit_time', '?')}\n"
@@ -207,7 +224,7 @@ Trades Closed Today: {len(todays_closed)}
 
     body += "\n\n═══════════════════════════════════════════════════════════\n"
     body += "Automated report from your Day Trading Agent.\n"
-    body += f"Strategy: VWAP Reclaim | 5-min bars | 1.5:1 R:R | Force close 3:50 PM ET\n"
+    body += f"Strategy: VWAP Reclaim & ORB Breakout | 5-min bars | 1.5:1 R:R | Force close 3:50 PM ET\n"
     body += f"Generated: {datetime.now(tz=ET).strftime('%Y-%m-%d %H:%M ET')}\n"
 
     return body

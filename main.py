@@ -114,26 +114,6 @@ def morning_research():
 
 
 @skip_if_not_market_day
-def gap_filter():
-    """Stage 2a: Gap filter at 9:15 AM — quote vs prior close."""
-    log.info("--- Pre-market gap filter (Stage 2a) ---")
-    try:
-        watchlist_agent.run_gap_filter()
-    except Exception as e:
-        log.error(f"Gap filter failed: {e}", exc_info=True)
-
-
-@skip_if_not_market_day
-def volume_confirm():
-    """Stage 2b: Volume confirm at 9:35 AM — first 5-min bar."""
-    log.info("--- Opening volume confirm (Stage 2b) ---")
-    try:
-        watchlist_agent.run_volume_confirm()
-    except Exception as e:
-        log.error(f"Volume confirm failed: {e}", exc_info=True)
-
-
-@skip_if_not_market_day
 def intraday_cycle():
     """
     Core intraday loop — runs every 5 minutes from 9:45 AM to 3:50 PM ET.
@@ -218,18 +198,6 @@ def setup_schedule():
     ).do(morning_research)
     log.info(f"Scheduled: research — {config.RESEARCH_HOUR:02d}:{config.RESEARCH_MINUTE:02d} ET")
 
-    # Gap filter — 9:15 AM
-    schedule.every().day.at(
-        f"{config.GAP_FILTER_HOUR:02d}:{config.GAP_FILTER_MINUTE:02d}"
-    ).do(gap_filter)
-    log.info(f"Scheduled: gap filter — {config.GAP_FILTER_HOUR:02d}:{config.GAP_FILTER_MINUTE:02d} ET")
-
-    # Volume confirm — 9:35 AM
-    schedule.every().day.at(
-        f"{config.VOLUME_CONFIRM_HOUR:02d}:{config.VOLUME_CONFIRM_MINUTE:02d}"
-    ).do(volume_confirm)
-    log.info(f"Scheduled: volume confirm — {config.VOLUME_CONFIRM_HOUR:02d}:{config.VOLUME_CONFIRM_MINUTE:02d} ET")
-
     # Intraday cycle — every 5 minutes from 9:30 AM to 4:00 PM
     # schedule library doesn't support "every N minutes between X and Y" natively,
     # so we schedule every 5 minutes all day and gate inside intraday_cycle()
@@ -286,15 +254,9 @@ def startup_sequence():
         log.info("8:00–8:30 AM: running watchlist + research")
         morning_watchlist()
         morning_research()
-    elif hour == 8 or (hour == 9 and minute < 15):
-        log.info("8:30–9:15 AM: running research + gap filter prep")
+    elif hour == 8 or (hour == 9 and minute < 30):
+        log.info("8:30–9:30 AM: running research")
         morning_research()
-    elif hour == 9 and minute < 35:
-        log.info("9:15–9:35 AM: running gap filter")
-        gap_filter()
-    elif hour == 9 and minute < 45:
-        log.info("9:35–9:45 AM: running volume confirm")
-        volume_confirm()
     elif 9 <= hour < 16:
         log.info("Market hours: running intraday cycle immediately")
         intraday_cycle()
