@@ -163,14 +163,14 @@ def score_intraday_setup(df: pd.DataFrame, news_sentiment: str = "neutral") -> d
 
     Hard gates (instant disqualification):
       - No VWAP reclaim pattern detected
-      - EMA9 <= EMA20 (downtrend — rejected outright)
+      - Daily EMA9 <= Daily EMA20 — checked externally in strategy_agent before calling this
 
     Scoring:
       VWAP reclaim (prev below, curr above, bullish candle)  +3  [hard gate]
-      EMA9 > EMA20 (intraday uptrend)                        +2  [hard gate]
-      RSI 40–68 (not overbought, has room to run)            +1
-      Volume on reclaim candle > 20-bar avg                  +2
-      Positive news sentiment                                +1
+      EMA9 > EMA20 on 5-min bars (intraday momentum)        +2  [bonus]
+      RSI 40–68 (not overbought, has room to run)            +1  [bonus]
+      Volume on reclaim candle > 20-bar avg                  +2  [bonus]
+      Positive news sentiment                                +1  [bonus]
       -------------------------------------------------------
       Max score: 9
       Minimum to qualify: 4
@@ -194,14 +194,6 @@ def score_intraday_setup(df: pd.DataFrame, news_sentiment: str = "neutral") -> d
             "reason": f"no_vwap_reclaim:{reclaim.get('reason', '')}",
         }
 
-    # --- Hard requirement: EMA9 > EMA20 (intraday uptrend) ---
-    if row["ema_fast"] <= row["ema_slow"]:
-        return {
-            "score": 0,
-            "qualified": False,
-            "reason": f"ema_downtrend:ema9={row['ema_fast']:.2f}_ema20={row['ema_slow']:.2f}",
-        }
-
     score = 3  # base score for the reclaim itself
     signals = {
         "vwap_reclaim": {
@@ -212,14 +204,23 @@ def score_intraday_setup(df: pd.DataFrame, news_sentiment: str = "neutral") -> d
         }
     }
 
-    # EMA9 > EMA20 — confirmed uptrend (passed hard gate above)
-    signals["ema_trend"] = {
-        "ema9": round(row["ema_fast"], 2),
-        "ema20": round(row["ema_slow"], 2),
-        "signal": "uptrend",
-        "points": 2,
-    }
-    score += 2
+    # EMA9 > EMA20 on 5-min bars — intraday momentum bonus
+    ema_uptrend = row["ema_fast"] > row["ema_slow"]
+    if ema_uptrend:
+        score += 2
+        signals["ema_trend"] = {
+            "ema9": round(row["ema_fast"], 2),
+            "ema20": round(row["ema_slow"], 2),
+            "signal": "uptrend",
+            "points": 2,
+        }
+    else:
+        signals["ema_trend"] = {
+            "ema9": round(row["ema_fast"], 2),
+            "ema20": round(row["ema_slow"], 2),
+            "signal": "downtrend",
+            "points": 0,
+        }
 
     # RSI in healthy range — not overbought
     rsi = row["rsi"]
@@ -392,15 +393,15 @@ def score_orb_setup(df: pd.DataFrame, news_sentiment: str = "neutral") -> dict:
 
     Hard gates (instant disqualification):
       - No ORB breakout pattern detected
-      - EMA9 <= EMA20 (downtrend — rejected outright)
+      - Daily EMA9 <= Daily EMA20 — checked externally in strategy_agent before calling this
 
     Scoring:
       ORB breakout (close above opening range high, bullish)  +3  [hard gate]
-      EMA9 > EMA20 (intraday uptrend)                         +2  [hard gate]
-      RSI 40–72 (momentum building, not exhausted)            +1
-      Volume on breakout candle >= 1.5x avg                   +2
-      Volume on breakout candle >= 1.0x avg                   +1
-      Positive news sentiment                                  +1
+      EMA9 > EMA20 on 5-min bars (intraday momentum)         +2  [bonus]
+      RSI 40–72 (momentum building, not exhausted)            +1  [bonus]
+      Volume on breakout candle >= 1.5x avg                   +2  [bonus]
+      Volume on breakout candle >= 1.0x avg                   +1  [bonus]
+      Positive news sentiment                                  +1  [bonus]
       -------------------------------------------------------
       Max score: 9
       Minimum to qualify: 4
@@ -425,15 +426,6 @@ def score_orb_setup(df: pd.DataFrame, news_sentiment: str = "neutral") -> dict:
             "setup_type": "orb",
         }
 
-    # --- Hard requirement: EMA9 > EMA20 (intraday uptrend) ---
-    if row["ema_fast"] <= row["ema_slow"]:
-        return {
-            "score": 0,
-            "qualified": False,
-            "reason": f"ema_downtrend:ema9={row['ema_fast']:.2f}_ema20={row['ema_slow']:.2f}",
-            "setup_type": "orb",
-        }
-
     score = 3  # base score for the breakout itself
     signals = {
         "orb_breakout": {
@@ -446,14 +438,23 @@ def score_orb_setup(df: pd.DataFrame, news_sentiment: str = "neutral") -> dict:
         }
     }
 
-    # EMA9 > EMA20 — confirmed uptrend (passed hard gate above)
-    signals["ema_trend"] = {
-        "ema9": round(float(row["ema_fast"]), 2),
-        "ema20": round(float(row["ema_slow"]), 2),
-        "signal": "uptrend",
-        "points": 2,
-    }
-    score += 2
+    # EMA9 > EMA20 on 5-min bars — intraday momentum bonus
+    ema_uptrend = row["ema_fast"] > row["ema_slow"]
+    if ema_uptrend:
+        score += 2
+        signals["ema_trend"] = {
+            "ema9": round(float(row["ema_fast"]), 2),
+            "ema20": round(float(row["ema_slow"]), 2),
+            "signal": "uptrend",
+            "points": 2,
+        }
+    else:
+        signals["ema_trend"] = {
+            "ema9": round(float(row["ema_fast"]), 2),
+            "ema20": round(float(row["ema_slow"]), 2),
+            "signal": "downtrend",
+            "points": 0,
+        }
 
     # RSI — allow slightly higher range for ORB (momentum breakouts can have higher RSI)
     rsi = float(row["rsi"])

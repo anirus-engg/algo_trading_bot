@@ -57,6 +57,8 @@ UNIVERSE_SIZE = 100                 # top N by avg daily dollar volume
 INTRADAY_TIMEFRAME_MINUTES = 5      # 5-min candles
 INTRADAY_BARS_LOOKBACK_DAYS = 10    # days of 5-min history for indicators
 DAILY_BARS_LOOKBACK_DAYS = 30       # days of daily bars for ATR/universe scoring
+DAILY_EMA_FAST = 9                  # daily EMA fast period — used as hard trend gate
+DAILY_EMA_SLOW = 20                 # daily EMA slow period — used as hard trend gate
 
 # Alpaca data feed for intraday bars
 # "iex" — free, works on Basic plan (~60% of market volume, fine for paper trading)
@@ -68,9 +70,11 @@ INTRADAY_DATA_FEED = "iex"
 BARS_LOOKBACK_DAYS = DAILY_BARS_LOOKBACK_DAYS
 
 # ---------------------------------------------------------------------------
-# Watchlist
+# Watchlist / pre-market filters
 # ---------------------------------------------------------------------------
 WATCHLIST_SIZE = 25
+MIN_GAP_PCT = 1.0               # minimum gap % from prior close to pass gap filter (9:15 AM)
+MIN_RELATIVE_VOLUME = 1.5       # minimum opening bar volume ratio to pass volume confirm (9:35 AM)
 
 # ---------------------------------------------------------------------------
 # Data paths

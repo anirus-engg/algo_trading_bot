@@ -59,6 +59,69 @@ def load_strategy_memory() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Daily bar fetching + trend gate
+# ---------------------------------------------------------------------------
+
+def fetch_daily_bars(symbols: list) -> dict:
+    """
+    Fetch daily bars for all symbols — used for the daily EMA trend gate.
+    Fetches one symbol at a time to stay within the IEX free tier.
+    Falls back gracefully: if a symbol fails, it is allowed through (uptrend assumed).
+    """
+    if not symbols:
+        return {}
+
+    client = StockHistoricalDataClient(config.APCA_API_KEY_ID, config.APCA_API_SECRET_KEY)
+    end = datetime.now()          # naive datetime — matches watchlist_agent pattern
+    start = end - timedelta(days=config.DAILY_BARS_LOOKBACK_DAYS)
+
+    result = {}
+    failed = 0
+    for symbol in symbols:
+        try:
+            from alpaca.data.timeframe import TimeFrame as TF
+            request = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TF.Day,
+                start=start,
+                end=end,
+            )
+            bars = client.get_stock_bars(request)
+            raw = bars.df if hasattr(bars, "df") else bars
+            if isinstance(raw.index, pd.MultiIndex):
+                df = raw.xs(symbol, level=0).copy()
+            else:
+                df = raw.copy()
+            if not df.empty:
+                result[symbol] = df
+        except Exception as e:
+            log.debug(f"{symbol}: daily bar fetch failed ({e}) — will allow through trend gate")
+            failed += 1
+
+    log.info(f"Daily bars fetched: {len(result)}/{len(symbols)} symbols ({failed} failed/skipped)")
+    return result
+
+
+def is_daily_uptrend(daily_df: pd.DataFrame) -> tuple[bool, str]:
+    """
+    Check if the stock is in a daily uptrend using EMA9 > EMA20 on daily bars.
+    Returns (is_uptrend: bool, detail: str).
+    Falls back to True (allow) if insufficient data.
+    """
+    if daily_df is None or len(daily_df) < config.DAILY_EMA_SLOW:
+        return True, "insufficient_daily_bars"
+
+    df = daily_df.copy()
+    df["ema_fast"] = df["close"].ewm(span=config.DAILY_EMA_FAST, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=config.DAILY_EMA_SLOW, adjust=False).mean()
+
+    row = df.iloc[-1]
+    uptrend = row["ema_fast"] > row["ema_slow"]
+    detail = f"daily_ema{config.DAILY_EMA_FAST}={row['ema_fast']:.2f}_ema{config.DAILY_EMA_SLOW}={row['ema_slow']:.2f}"
+    return uptrend, detail
+
+
+# ---------------------------------------------------------------------------
 # 5-min bar fetching
 # ---------------------------------------------------------------------------
 
@@ -120,6 +183,9 @@ def score_candidates(watchlist_stocks: list, brief: dict, memory: dict) -> list:
     Score all watchlist stocks for both VWAP Reclaim and ORB Breakout setups.
     A stock can qualify via either setup. If both qualify, the higher-scoring
     setup wins. Returns ranked list of qualified candidates.
+
+    Daily EMA trend gate: stocks where daily EMA9 <= daily EMA20 are rejected
+    before intraday scoring. This is more stable than the 5-min EMA gate.
     """
     if not watchlist_stocks:
         log.info("No stocks to score")
@@ -129,6 +195,8 @@ def score_candidates(watchlist_stocks: list, brief: dict, memory: dict) -> list:
     candidates = []
     disqualified = []
 
+    # Fetch daily bars once for the trend gate, then intraday bars for scoring
+    daily_bars = fetch_daily_bars(symbols)
     bars_by_symbol = fetch_intraday_bars(symbols)
 
     log.info(f"Scoring {len(symbols)} stocks (VWAP Reclaim + ORB Breakout)...")
@@ -136,6 +204,15 @@ def score_candidates(watchlist_stocks: list, brief: dict, memory: dict) -> list:
     for stock in watchlist_stocks:
         symbol = stock["symbol"]
         try:
+            # --- Daily EMA trend gate (hard gate, runs before intraday scoring) ---
+            uptrend, trend_detail = is_daily_uptrend(daily_bars.get(symbol))
+            if not uptrend:
+                log.debug(f"{symbol}: REJECTED — daily downtrend ({trend_detail})")
+                disqualified.append((symbol, f"daily_downtrend"))
+                continue
+            else:
+                log.debug(f"{symbol}: daily uptrend confirmed ({trend_detail})")
+
             df = bars_by_symbol.get(symbol)
             if df is None or df.empty:
                 log.debug(f"{symbol}: no 5-min bar data — skipping")
@@ -200,6 +277,7 @@ def score_candidates(watchlist_stocks: list, brief: dict, memory: dict) -> list:
                 "rsi": best_result["rsi"],
                 "atr": best_result["atr"],
                 "sentiment": sentiment,
+                "daily_trend": trend_detail,
             }
 
             # Add ORB levels if applicable

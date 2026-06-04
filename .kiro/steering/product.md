@@ -16,7 +16,8 @@ P&L after each session to improve over time.
 - Dual strategy scoring every 5 min on all 25 watchlist stocks:
   - **VWAP Reclaim**: price dips below VWAP then reclaims it with a bullish candle
   - **ORB Breakout**: price breaks above the 9:30–9:45 AM opening range high with a bullish candle (valid until 1:00 PM ET only)
-- Both setups require EMA9 > EMA20 — downtrend stocks are rejected outright
+- Both setups require **daily EMA9 > EMA20** — stocks in a daily downtrend are rejected outright before intraday scoring
+- The 5-min EMA9/EMA20 is a +2 bonus signal, not a hard gate
 - Best qualifying setup per stock wins (higher score takes priority)
 - Bracket order execution: setup-specific stops, 1.5:1 R:R target
 - Force close at 3:50 PM ET — no overnight holds
@@ -30,7 +31,7 @@ P&L after each session to improve over time.
 |---|---|---|
 | Candle timeframe | 5-minute | 5-minute |
 | Entry trigger | Prev candle below VWAP, current candle closes above VWAP (bullish) | Current candle closes above opening range high (bullish) |
-| EMA filter | EMA9 > EMA20 — **hard gate, rejects downtrends** | EMA9 > EMA20 — **hard gate, rejects downtrends** |
+| EMA filter | **Daily EMA9 > EMA20** (hard gate) + 5-min EMA9 > EMA20 (+2 bonus) | **Daily EMA9 > EMA20** (hard gate) + 5-min EMA9 > EMA20 (+2 bonus) |
 | RSI filter | 40–68 (bonus, not required) | 40–72 (bonus, not required) |
 | Volume filter | Above 20-bar avg (bonus, not required) | Above 20-bar avg (bonus, not required) |
 | Stop loss | 0.5x ATR (5-min) below entry | Below ORB low − 0.1x ATR |
