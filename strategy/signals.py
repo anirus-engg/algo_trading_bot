@@ -108,46 +108,58 @@ def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # VWAP Reclaim pattern detection
 # ---------------------------------------------------------------------------
 
-def detect_vwap_reclaim(df: pd.DataFrame) -> dict:
+def detect_vwap_reclaim(df: pd.DataFrame, lookback: int = 2) -> dict:
     """
-    Detect a VWAP reclaim setup on the most recent candle.
+    Detect a VWAP reclaim setup within the last `lookback` bars.
 
-    Conditions:
+    Looks back up to `lookback` bars for a candle where:
       1. Previous candle closed BELOW VWAP (the dip)
-      2. Current candle closes ABOVE VWAP (the reclaim)
-      3. Current candle is bullish (close > open)
+      2. That candle closes ABOVE VWAP (the reclaim)
+      3. The reclaim candle is bullish (close > open)
+      4. Current price is still above VWAP (setup not yet invalidated)
 
-    Returns dict with detected flag and details.
+    Using lookback=2 covers the ~10-minute scheduling gap between when a
+    reclaim forms and when the agent fires. Price must remain above VWAP
+    at the current bar — if it dropped back below, the setup is invalidated.
+
+    Returns dict with detected flag, the reclaim bar index, and details.
     """
     if len(df) < 3:
         return {"detected": False, "reason": "insufficient_bars"}
 
+    # Current bar must still be above VWAP — if not, any prior reclaim is invalid
     curr = df.iloc[-1]
-    prev = df.iloc[-2]
+    if curr["close"] <= curr["vwap"]:
+        return {"detected": False, "reason": "curr_not_above_vwap"}
 
-    prev_below_vwap = prev["close"] < prev["vwap"]
-    curr_above_vwap = curr["close"] > curr["vwap"]
-    curr_bullish = curr["close"] > curr["open"]
+    # Search the last `lookback` bars for a reclaim candle
+    # Bar at position -1 is current, -2 is one bar ago, etc.
+    # We need pairs: (bar[i-1], bar[i]) where bar[i-1] was below VWAP and bar[i] reclaimed
+    search_end = len(df) - 1          # index of current bar (already confirmed above VWAP)
+    search_start = max(1, search_end - lookback + 1)  # how far back to look for the reclaim
 
-    if prev_below_vwap and curr_above_vwap and curr_bullish:
-        vwap_reclaim_size = curr["close"] - curr["vwap"]
-        return {
-            "detected": True,
-            "vwap": round(curr["vwap"], 2),
-            "close": round(curr["close"], 2),
-            "reclaim_size": round(vwap_reclaim_size, 2),
-            "prev_close": round(prev["close"], 2),
-        }
+    for i in range(search_end, search_start - 1, -1):
+        reclaim_bar = df.iloc[i]
+        prev_bar = df.iloc[i - 1]
 
-    reason = []
-    if not prev_below_vwap:
-        reason.append("prev_not_below_vwap")
-    if not curr_above_vwap:
-        reason.append("curr_not_above_vwap")
-    if not curr_bullish:
-        reason.append("curr_not_bullish")
+        prev_below_vwap = prev_bar["close"] < prev_bar["vwap"]
+        reclaim_above_vwap = reclaim_bar["close"] > reclaim_bar["vwap"]
+        reclaim_bullish = reclaim_bar["close"] > reclaim_bar["open"]
 
-    return {"detected": False, "reason": "+".join(reason)}
+        if prev_below_vwap and reclaim_above_vwap and reclaim_bullish:
+            bars_ago = search_end - i
+            vwap_reclaim_size = reclaim_bar["close"] - reclaim_bar["vwap"]
+            return {
+                "detected": True,
+                "vwap": round(curr["vwap"], 2),          # use current VWAP for scoring
+                "close": round(curr["close"], 2),         # use current price for entry
+                "reclaim_size": round(vwap_reclaim_size, 2),
+                "prev_close": round(prev_bar["close"], 2),
+                "reclaim_bar_close": round(reclaim_bar["close"], 2),
+                "bars_ago": bars_ago,                     # 0 = current bar, 1 = one bar ago
+            }
+
+    return {"detected": False, "reason": "no_reclaim_in_lookback"}
 
 
 # ---------------------------------------------------------------------------
@@ -162,15 +174,16 @@ def score_intraday_setup(df: pd.DataFrame, news_sentiment: str = "neutral") -> d
     Minimum score of 4 required to qualify.
 
     Hard gates (instant disqualification):
-      - No VWAP reclaim pattern detected
+      - No VWAP reclaim within the last VWAP_RECLAIM_LOOKBACK_BARS bars
+        (currently 2 bars = 10 min), OR current price is back below VWAP
       - Daily EMA9 <= Daily EMA20 — checked externally in strategy_agent before calling this
 
     Scoring:
-      VWAP reclaim (prev below, curr above, bullish candle)  +3  [hard gate]
-      EMA9 > EMA20 on 5-min bars (intraday momentum)        +2  [bonus]
-      RSI 40–68 (not overbought, has room to run)            +1  [bonus]
-      Volume on reclaim candle > 20-bar avg                  +2  [bonus]
-      Positive news sentiment                                +1  [bonus]
+      VWAP reclaim (within lookback, price still above VWAP)  +3  [hard gate]
+      EMA9 > EMA20 on 5-min bars (intraday momentum)          +2  [bonus]
+      RSI 40–68 (not overbought, has room to run)             +1  [bonus]
+      Volume on reclaim candle > 20-bar avg                   +2  [bonus]
+      Positive news sentiment                                  +1  [bonus]
       -------------------------------------------------------
       Max score: 9
       Minimum to qualify: 4
@@ -185,8 +198,8 @@ def score_intraday_setup(df: pd.DataFrame, news_sentiment: str = "neutral") -> d
 
     row = df.iloc[-1]
 
-    # --- Hard requirement: VWAP reclaim must be present ---
-    reclaim = detect_vwap_reclaim(df)
+    # --- Hard requirement: VWAP reclaim must be present (within lookback window) ---
+    reclaim = detect_vwap_reclaim(df, lookback=config.VWAP_RECLAIM_LOOKBACK_BARS)
     if not reclaim["detected"]:
         return {
             "score": 0,
@@ -200,6 +213,7 @@ def score_intraday_setup(df: pd.DataFrame, news_sentiment: str = "neutral") -> d
             "vwap": reclaim["vwap"],
             "close": reclaim["close"],
             "reclaim_size": reclaim["reclaim_size"],
+            "bars_ago": reclaim.get("bars_ago", 0),
             "points": 3,
         }
     }

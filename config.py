@@ -30,6 +30,11 @@ MIN_SIGNAL_SCORE = 4                # minimum score to qualify as a candidate
 REWARD_RISK_RATIO = 1.5             # 1.5:1 R:R target
 MAX_OPEN_POSITIONS = 5
 
+# VWAP reclaim lookback: how many bars back to search for a reclaim candle.
+# 2 bars = 10 min, covering the worst-case scheduling gap between reclaim and agent fire.
+# Price must still be above VWAP at current bar — stale reclaims are auto-invalidated.
+VWAP_RECLAIM_LOOKBACK_BARS = 2
+
 # Stop loss: 0.5x ATR (5-min) below entry candle low
 STOP_ATR_MULTIPLIER = 0.5
 
