@@ -114,6 +114,26 @@ def morning_research():
 
 
 @skip_if_not_market_day
+def morning_gap_filter():
+    """Stage 2a: Gap filter (quote vs prior close)."""
+    log.info("--- Morning gap filter scan (Stage 2a) ---")
+    try:
+        watchlist_agent.run_gap_filter()
+    except Exception as e:
+        log.error(f"Gap filter failed: {e}", exc_info=True)
+
+
+@skip_if_not_market_day
+def morning_volume_confirm():
+    """Stage 2b: Opening volume confirmation."""
+    log.info("--- Morning volume confirmation (Stage 2b) ---")
+    try:
+        watchlist_agent.run_volume_confirm()
+    except Exception as e:
+        log.error(f"Volume confirmation failed: {e}", exc_info=True)
+
+
+@skip_if_not_market_day
 def intraday_cycle():
     """
     Core intraday loop — runs every 5 minutes from 9:45 AM to 3:50 PM ET.
@@ -197,6 +217,14 @@ def setup_schedule():
         f"{config.RESEARCH_HOUR:02d}:{config.RESEARCH_MINUTE:02d}"
     ).do(morning_research)
     log.info(f"Scheduled: research — {config.RESEARCH_HOUR:02d}:{config.RESEARCH_MINUTE:02d} ET")
+
+    # Pre-market gap filter — 9:15 AM
+    schedule.every().day.at("09:15").do(morning_gap_filter)
+    log.info("Scheduled: gap filter — 09:15 ET")
+
+    # Opening volume confirm — 9:35 AM
+    schedule.every().day.at("09:35").do(morning_volume_confirm)
+    log.info("Scheduled: volume confirm — 09:35 ET")
 
     # Intraday cycle — every 5 minutes from 9:30 AM to 4:00 PM
     # schedule library doesn't support "every N minutes between X and Y" natively,

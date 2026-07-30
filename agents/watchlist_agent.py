@@ -68,8 +68,8 @@ def fetch_daily_bars(symbols: list, days: int = config.BARS_LOOKBACK_DAYS) -> pd
 
 def score_stock_daily(symbol: str, df: pd.DataFrame) -> dict:
     """Score a stock for day trading potential using daily bars."""
-    if len(df) < 21:
-        log.debug(f"{symbol}: skipped — only {len(df)} bars (need 21)")
+    if len(df) < 15:
+        log.debug(f"{symbol}: skipped — only {len(df)} bars (need 15)")
         return {"symbol": symbol, "score": 0, "reason": "insufficient_data"}
 
     df = df.copy()

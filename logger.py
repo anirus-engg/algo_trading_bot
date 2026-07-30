@@ -8,7 +8,11 @@ from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 
 LOG_DIR = os.path.expanduser("~/.local/share/stockagent")
-os.makedirs(LOG_DIR, exist_ok=True)
+try:
+    os.makedirs(LOG_DIR, exist_ok=True)
+except OSError:
+    LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(LOG_DIR, exist_ok=True)
 
 
 def get_logger(name: str) -> logging.Logger:

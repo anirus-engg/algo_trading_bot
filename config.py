@@ -10,9 +10,9 @@ APCA_API_BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.mar
 
 # Anthropic
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-# claude-haiku-4-5       — fast, cheap (~4x less than Sonnet), good enough for sentiment + memory
-# claude-sonnet-4-5      — higher quality, use if memory/reasoning quality degrades
-ANTHROPIC_MODEL = "claude-haiku-4-5"
+# claude-3-5-haiku-20241022 — fast, cheap, good for sentiment + memory
+# claude-3-5-sonnet-20241022 — higher quality, use if memory/reasoning quality degrades
+ANTHROPIC_MODEL = "claude-3-5-haiku-20241022"
 
 # Email settings
 EMAIL_TO = os.getenv("EMAIL_TO", "aniruddhags@gmail.com")
@@ -61,7 +61,7 @@ UNIVERSE_SIZE = 100                 # top N by avg daily dollar volume
 # ---------------------------------------------------------------------------
 INTRADAY_TIMEFRAME_MINUTES = 5      # 5-min candles
 INTRADAY_BARS_LOOKBACK_DAYS = 10    # days of 5-min history for indicators
-DAILY_BARS_LOOKBACK_DAYS = 30       # days of daily bars for ATR/universe scoring
+DAILY_BARS_LOOKBACK_DAYS = 45       # days of daily bars for ATR/universe scoring (approx 30 trading days)
 DAILY_EMA_FAST = 9                  # daily EMA fast period — used as hard trend gate
 DAILY_EMA_SLOW = 20                 # daily EMA slow period — used as hard trend gate
 

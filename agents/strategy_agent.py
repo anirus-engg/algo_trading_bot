@@ -29,12 +29,22 @@ ET = ZoneInfo("America/New_York")
 # ---------------------------------------------------------------------------
 
 def load_watchlist() -> list:
-    """Load the daily watchlist — all 25 stocks scored every cycle."""
+    """Load intraday watchlist if available, falling back to daily watchlist."""
+    try:
+        with open(config.INTRADAY_WATCHLIST_PATH) as f:
+            data = json.load(f)
+        stocks = data.get("stocks", [])
+        if stocks:
+            log.info(f"Intraday watchlist loaded: {len(stocks)} stocks")
+            return stocks
+    except FileNotFoundError:
+        pass
+
     try:
         with open(config.WATCHLIST_PATH) as f:
             data = json.load(f)
         stocks = data.get("watchlist", [])
-        log.info(f"Watchlist loaded: {len(stocks)} stocks")
+        log.info(f"Daily watchlist loaded: {len(stocks)} stocks")
         return stocks
     except FileNotFoundError:
         log.warning("watchlist.json not found — no stocks to score")
@@ -65,40 +75,55 @@ def load_strategy_memory() -> dict:
 def fetch_daily_bars(symbols: list) -> dict:
     """
     Fetch daily bars for all symbols — used for the daily EMA trend gate.
-    Fetches one symbol at a time to stay within the IEX free tier.
-    Falls back gracefully: if a symbol fails, it is allowed through (uptrend assumed).
+    Batches API request for efficiency with fallback per symbol.
     """
     if not symbols:
         return {}
 
     client = StockHistoricalDataClient(config.APCA_API_KEY_ID, config.APCA_API_SECRET_KEY)
-    end = datetime.now()          # naive datetime — matches watchlist_agent pattern
+    end = datetime.now()
     start = end - timedelta(days=config.DAILY_BARS_LOOKBACK_DAYS)
 
     result = {}
-    failed = 0
-    for symbol in symbols:
-        try:
-            from alpaca.data.timeframe import TimeFrame as TF
-            request = StockBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=TF.Day,
-                start=start,
-                end=end,
-            )
-            bars = client.get_stock_bars(request)
-            raw = bars.df if hasattr(bars, "df") else bars
-            if isinstance(raw.index, pd.MultiIndex):
-                df = raw.xs(symbol, level=0).copy()
-            else:
-                df = raw.copy()
-            if not df.empty:
-                result[symbol] = df
-        except Exception as e:
-            log.debug(f"{symbol}: daily bar fetch failed ({e}) — will allow through trend gate")
-            failed += 1
+    try:
+        from alpaca.data.timeframe import TimeFrame as TF
+        request = StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=TF.Day,
+            start=start,
+            end=end,
+        )
+        bars = client.get_stock_bars(request)
+        multi_df = bars.df if hasattr(bars, "df") else bars
+        if isinstance(multi_df, pd.DataFrame) and not multi_df.empty:
+            for symbol in symbols:
+                try:
+                    df = (multi_df.xs(symbol, level=0).copy()
+                          if multi_df.index.nlevels > 1 else multi_df.copy())
+                    if not df.empty:
+                        result[symbol] = df
+                except KeyError:
+                    pass
+    except Exception as e:
+        log.warning(f"Batched daily bar fetch failed ({e}) — trying individual fetches")
+        for symbol in symbols:
+            try:
+                from alpaca.data.timeframe import TimeFrame as TF
+                request = StockBarsRequest(
+                    symbol_or_symbols=symbol,
+                    timeframe=TF.Day,
+                    start=start,
+                    end=end,
+                )
+                bars = client.get_stock_bars(request)
+                raw = bars.df if hasattr(bars, "df") else bars
+                df = raw.xs(symbol, level=0).copy() if isinstance(raw.index, pd.MultiIndex) else raw.copy()
+                if not df.empty:
+                    result[symbol] = df
+            except Exception:
+                pass
 
-    log.info(f"Daily bars fetched: {len(result)}/{len(symbols)} symbols ({failed} failed/skipped)")
+    log.info(f"Daily bars fetched: {len(result)}/{len(symbols)} symbols")
     return result
 
 
