@@ -65,40 +65,61 @@ def update_memory_with_claude(memory: dict, new_trades: list) -> dict:
     log.info(f"Sending {len(new_trades)} new trades to Claude for analysis...")
     client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
-    prompt = f"""You are analyzing our swing trading performance to improve our strategy.
+    trades_summary = [
+        {
+            "symbol": t.get("symbol"),
+            "setup_type": t.get("setup_type", "vwap_reclaim"),
+            "outcome": t.get("outcome"),
+            "pnl": t.get("pnl"),
+            "exit_reason": t.get("exit_reason"),
+            "entry_price": t.get("entry_price", t.get("entry")),
+            "exit_price": t.get("exit_price"),
+            "score": t.get("score"),
+            "signals_at_entry": t.get("signals_at_entry", {}),
+        }
+        for t in new_trades
+    ]
 
-Current strategy memory:
-{json.dumps(memory, indent=2)}
+    wins = sum(1 for t in new_trades if t.get("outcome") == "win")
+    losses = sum(1 for t in new_trades if t.get("outcome") == "loss")
+    total_pnl = sum(t.get("pnl", 0) for t in new_trades)
 
-New closed trades since last update:
-{json.dumps(new_trades, indent=2)}
+    prompt = f"""You are a quantitative trading analyst reviewing intraday day trading results.
 
-Tasks:
-1. Analyze what's working and what's not
-2. Identify patterns in winning vs losing trades
-3. Update the "strategy_notes" field with actionable insights
-4. Suggest any rule adjustments
+Previous strategy notes:
+{memory.get('strategy_notes', 'No prior notes.')}
 
-Return the updated memory object as valid JSON with an updated "strategy_notes" field.
-Keep it concise (max 500 words)."""
+New closed trades ({len(new_trades)} trades, {wins}W/{losses}L, P&L=${total_pnl:+.2f}):
+{json.dumps(trades_summary, indent=2)}
+
+Write 3-5 concise bullet-point insights covering:
+- What setups/signals are working vs failing
+- Patterns in wins vs losses (score, volume, exit reason)
+- Any actionable rule adjustments
+
+Return ONLY the bullet points as plain text (no JSON, no headers)."""
 
     try:
         response = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=2000,
+            model=config.ANTHROPIC_MODEL,
+            max_tokens=600,
             messages=[{"role": "user", "content": prompt}],
             system=[{
                 "type": "text",
-                "text": "You are a quantitative trading analyst. Return only valid JSON.",
+                "text": "You are a quantitative trading analyst. Be concise and actionable.",
                 "cache_control": {"type": "ephemeral"}
             }]
         )
 
-        content = response.content[0].text
-        updated_memory = json.loads(content)
-        log.info(f"Strategy notes updated by Claude")
-        log.debug(f"New strategy notes: {updated_memory.get('strategy_notes', '')[:300]}")
-        return updated_memory
+        notes = response.content[0].text.strip()
+        if notes:
+            memory["strategy_notes"] = notes
+            log.info(f"Strategy notes updated by Claude")
+            log.debug(f"New strategy notes: {notes[:300]}")
+        else:
+            log.warning("Claude returned empty notes — keeping existing")
+
+        return memory
 
     except Exception as e:
         log.warning(f"Claude memory update failed: {e}")
